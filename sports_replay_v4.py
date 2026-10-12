@@ -9,6 +9,11 @@ import threading
 import subprocess
 import re
 import shutil
+import glob
+import math
+import tempfile
+import traceback
+import faulthandler
 from datetime import datetime
 
 # Google Drive Libraries
@@ -74,11 +79,20 @@ AUTH_DIR = os.path.join(APP_DIR, "auth")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "vibe_config.json")
 QUEUE_FILE = os.path.join(UPLOAD_DIR, "vibe_upload_queue.json")
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
+SEGMENT_SECONDS = 5
+SEGMENT_COUNT = 16  # Mantém aproximadamente 80 segundos em buffer circular.
 
 # Ensure base folders exist
 for folder in [BASE_REPLAYS_DIR, UPLOAD_DIR, PENDING_DIR, TEMP_DIR, CONFIG_DIR, LOG_DIR, AUTH_DIR]:
     if not os.path.exists(folder):
         os.makedirs(folder)
+
+CRASH_LOG_FILE = os.path.join(LOG_DIR, "vibe_crash_log.txt")
+try:
+    _crash_log_handle = open(CRASH_LOG_FILE, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(_crash_log_handle, all_threads=True)
+except Exception:
+    _crash_log_handle = None
 
 def get_court_dir(court_name):
     """Gets or creates folder specific to a court."""
@@ -106,23 +120,39 @@ class FFmpegRecorder(QObject):
         self.url = url
         self.process = None
         self.running = False
-        self.temp_file = os.path.join(TEMP_DIR, "live_buffer.ts")
+        self.segment_pattern = os.path.join(TEMP_DIR, "live_buffer_%03d.ts")
+        self.started_at = None
 
     def start_recording(self):
         self.running = True
+        self.started_at = time.monotonic()
+        for old_segment in glob.glob(os.path.join(TEMP_DIR, "live_buffer_*.ts")):
+            try:
+                os.remove(old_segment)
+            except OSError:
+                pass
         threading.Thread(target=self._run_ffmpeg, daemon=True).start()
 
     def stop_recording(self):
         self.running = False
         if self.process:
             self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
     def _run_ffmpeg(self):
         cmd = [
             get_ffmpeg_path(), '-y', '-rtsp_transport', 'tcp',
             '-i', self.url,
-            '-c', 'copy', '-map', '0',
-            '-f', 'mpegts', self.temp_file
+            '-map', '0:v:0', '-map', '0:a?', '-c', 'copy',
+            '-f', 'segment',
+            '-segment_time', str(SEGMENT_SECONDS),
+            '-segment_wrap', str(SEGMENT_COUNT),
+            '-reset_timestamps', '1',
+            '-segment_format', 'mpegts',
+            self.segment_pattern
         ]
         
         try:
@@ -131,38 +161,84 @@ class FFmpegRecorder(QObject):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            self.process = subprocess.Popen(cmd, startupinfo=startupinfo)
-            self.process.wait()
+            self.process = subprocess.Popen(
+                cmd,
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            _, stderr = self.process.communicate()
+            if self.running and self.process.returncode != 0:
+                log_error(f"FFmpeg stopped ({self.process.returncode}): {stderr[-2000:]}")
+                self.status_msg.emit("Erro FFmpeg / Câmera", "#ef4444")
         except Exception as e:
             log_error(f"FFmpeg Recorder Error: {str(e)}")
             self.status_msg.emit("Erro FFmpeg (Audio)", "#ef4444")
 
     def extract_replay(self, seconds, output_path):
-        """Cuts the last N seconds from the current temporary buffer."""
-        if not os.path.exists(self.temp_file):
+        """Creates an exact-duration replay from the circular segment buffer."""
+        if not self.started_at or time.monotonic() - self.started_at < seconds:
+            log_error(f"Replay requested before {seconds}s of buffer were available")
             return False
 
-        cmd = [
-            get_ffmpeg_path(), '-y', '-sseof', f'-{seconds}',
-            '-i', self.temp_file,
-            '-map', '0:v', '-map', '0:a?',
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            output_path
-        ]
-
         try:
+            segments = sorted(
+                glob.glob(os.path.join(TEMP_DIR, "live_buffer_*.ts")),
+                key=os.path.getmtime
+            )
+            needed = math.ceil(seconds / SEGMENT_SECONDS) + 2
+            segments = segments[-needed:]
+            if not segments:
+                return False
+
+            snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=TEMP_DIR)
+            concat_file = os.path.join(snapshot_dir, "segments.txt")
+            snapshot_segments = []
+            for index, segment in enumerate(segments):
+                snapshot = os.path.join(snapshot_dir, f"segment_{index:03d}.ts")
+                shutil.copy2(segment, snapshot)
+                snapshot_segments.append(snapshot)
+
+            with open(concat_file, "w", encoding="utf-8") as file_list:
+                for segment in snapshot_segments:
+                    safe_path = segment.replace("'", "'\\''")
+                    file_list.write(f"file '{safe_path}'\n")
+
+            cmd = [
+                get_ffmpeg_path(), '-y',
+                '-sseof', f'-{seconds}',
+                '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-t', str(seconds),
+                '-map', '0:v:0', '-map', '0:a?',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                output_path
+            ]
+
             startupinfo = None
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            proc = subprocess.Popen(cmd, startupinfo=startupinfo)
-            proc.wait()
-            return True
+            proc = subprocess.run(
+                cmd,
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if proc.returncode != 0:
+                log_error(f"Replay extraction FFmpeg error ({proc.returncode}): {proc.stderr[-2000:]}")
+                return False
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
         except Exception as e:
-            log_error(f"Replay extraction error: {str(e)}")
+            log_error(f"Replay extraction error: {traceback.format_exc()}")
             return False
+        finally:
+            if 'snapshot_dir' in locals():
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 class CameraWorker(QObject):
     """Live Preview thread using OpenCV (Video only for UI)."""
@@ -480,12 +556,14 @@ class ArcadeInput(QObject):
 
     def _check_clicks(self):
         if self.click_count == 1:
-            self.trigger.emit(32)
+            self.trigger.emit(30)
         elif self.click_count >= 2:
-            self.trigger.emit(62)
+            self.trigger.emit(60)
         self.click_count = 0
 
 class App(QMainWindow):
+    thread_status = pyqtSignal(str, str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VIBE REPLAY PRO - Vibe Group")
@@ -513,6 +591,7 @@ class App(QMainWindow):
 
         self._init_ui()
         self._init_arcade()
+        self.thread_status.connect(self._set_status)
         self.uploader.status_signal.connect(self._set_status)
 
     def _init_ui(self):
@@ -563,9 +642,9 @@ class App(QMainWindow):
         main_v.addWidget(self.log_area)
 
         btns = QHBoxLayout()
-        b32 = QPushButton("REPLAY 32s (AUDIO)"); b32.clicked.connect(lambda: self._trigger(32)); b32.setStyleSheet("background-color: #059669; height: 50px;")
-        b62 = QPushButton("REPLAY 62s (AUDIO)"); b62.clicked.connect(lambda: self._trigger(62)); b62.setStyleSheet("background-color: #7c3aed; height: 50px;")
-        btns.addWidget(b32); btns.addWidget(b62); main_v.addLayout(btns)
+        b30 = QPushButton("REPLAY 30s (AUDIO)"); b30.clicked.connect(lambda: self._trigger(30)); b30.setStyleSheet("background-color: #059669; height: 50px;")
+        b60 = QPushButton("REPLAY 60s (AUDIO)"); b60.clicked.connect(lambda: self._trigger(60)); b60.setStyleSheet("background-color: #7c3aed; height: 50px;")
+        btns.addWidget(b30); btns.addWidget(b60); main_v.addLayout(btns)
         layout.addLayout(main_v)
 
     def _init_arcade(self):
@@ -578,11 +657,11 @@ class App(QMainWindow):
         self.hw_tag.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     def keyPressEvent(self, event):
-        """Keyboard fallback for Arcade / USB Keypads (Space = 32s, Enter/Return = 62s)."""
+        """Keyboard fallback for Arcade / USB Keypads (Space = 30s, Enter/Return = 60s)."""
         if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_1):
-            self._trigger(32)
+            self._trigger(30)
         elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_2):
-            self._trigger(62)
+            self._trigger(60)
         else:
             super().keyPressEvent(event)
 
@@ -635,14 +714,14 @@ class App(QMainWindow):
         output_path = os.path.join(court_dir, output_filename)
         
         def _process():
-            self._set_status(f"[{court_name}] Cortando {sec}s com Áudio...", "#fbbf24")
+            self.thread_status.emit(f"[{court_name}] Cortando {sec}s com Áudio...", "#fbbf24")
             success = self.recorder.extract_replay(sec, output_path)
             
             if success:
-                self._set_status(f"[{court_name}] Replay Gerado!", "#22c55e")
+                self.thread_status.emit(f"[{court_name}] Replay de {sec}s Gerado!", "#22c55e")
                 self.uploader.add_to_queue(output_path)
             else:
-                self._set_status(f"[{court_name}] Erro no Corte Audio", "#ef4444")
+                self.thread_status.emit(f"[{court_name}] Buffer insuficiente ou erro no corte", "#ef4444")
         
         threading.Thread(target=_process, daemon=True).start()
 
@@ -675,7 +754,18 @@ class App(QMainWindow):
             json.dump(self.courts, f)
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = App()
-    window.show()
-    sys.exit(app.exec())
+    def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+        details = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        log_error(f"Unhandled exception:\n{details}")
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = handle_uncaught_exception
+
+    try:
+        app = QApplication(sys.argv)
+        window = App()
+        window.show()
+        sys.exit(app.exec())
+    except Exception:
+        log_error(f"Fatal startup error:\n{traceback.format_exc()}")
+        raise

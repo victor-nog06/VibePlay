@@ -22,4 +22,9 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   exit 1
 fi
 
-exec "$VENV_DIR/bin/python3" "$APP_DIR/sports_replay_v4.py"
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
+export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
+
+echo "[$(date --iso-8601=seconds)] Iniciando VibePlay" >> "$APP_DIR/logs/runtime.log"
+exec "$VENV_DIR/bin/python3" "$APP_DIR/sports_replay_v4.py" >> "$APP_DIR/logs/runtime.log" 2>&1
