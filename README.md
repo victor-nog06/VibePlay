@@ -59,8 +59,22 @@ sudo systemctl restart vibeplay
 
 O servico grafico pressupoe uma sessao desktop no display `:0`.
 
-## Google Drive
+## Upload para o Supabase
 
-Para habilitar uploads, coloque `credentials.json` dentro de `auth/`. O token sera criado nessa mesma pasta depois da primeira autenticacao.
+O upload e feito pelo backend, sem armazenar a chave administrativa do Supabase no Raspberry.
+
+1. Configure no backend a variavel `REPLAY_UPLOAD_TOKEN` com um segredo aleatorio de pelo menos 40 caracteres.
+2. Configure `config/supabase_upload.json` com a URL publica do backend, o mesmo token e o ID da arena.
+3. Em `config/vibe_config.json`, informe o `court_id` de cada quadra.
+
+Exemplo:
+
+```json
+{
+  "backend_url": "https://api.exemplo.com",
+  "device_token": "segredo-compartilhado-com-o-backend",
+  "arena_id": "uuid-da-arena"
+}
+```
 
 Arquivos de credenciais, configuracao local das cameras, replays, temporarios e builds sao ignorados pelo Git.

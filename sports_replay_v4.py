@@ -14,18 +14,8 @@ import math
 import tempfile
 import traceback
 import faulthandler
+import requests
 from datetime import datetime
-
-# Google Drive Libraries
-try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    DRIVE_AVAILABLE = True
-except ImportError:
-    DRIVE_AVAILABLE = False
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -77,8 +67,8 @@ CONFIG_DIR = os.path.join(APP_DIR, "config")
 LOG_DIR = os.path.join(APP_DIR, "logs")
 AUTH_DIR = os.path.join(APP_DIR, "auth")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "vibe_config.json")
+UPLOAD_CONFIG_FILE = os.path.join(CONFIG_DIR, "supabase_upload.json")
 QUEUE_FILE = os.path.join(UPLOAD_DIR, "vibe_upload_queue.json")
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
 SEGMENT_SECONDS = 5
 SEGMENT_COUNT = 16  # Mantém aproximadamente 80 segundos em buffer circular.
 
@@ -295,8 +285,8 @@ class CameraWorker(QObject):
             log_error(f"UI Preview Error: {str(e)}")
         self._safe_emit("finished")
 
-class DriveUploader(QObject):
-    """Handles background uploads to Google Drive with persistent queue and auto-retry fault tolerance."""
+class SupabaseUploader(QObject):
+    """Uploads replays through the authenticated backend into Supabase."""
     status_signal = pyqtSignal(str, str)
 
     def __init__(self):
@@ -312,6 +302,35 @@ class DriveUploader(QObject):
 
         # On startup, index any unqueued local files across all court directories
         QTimer.singleShot(2000, self._scan_local_unuploaded)
+
+    def _load_upload_config(self):
+        try:
+            with open(UPLOAD_CONFIG_FILE, 'r', encoding='utf-8') as config_file:
+                config = json.load(config_file)
+            backend_url = str(config.get('backend_url', '')).rstrip('/')
+            device_token = str(config.get('device_token', '')).strip()
+            arena_id = str(config.get('arena_id', '')).strip()
+            if not backend_url or len(device_token) < 40 or not arena_id:
+                return None
+            return {"backend_url": backend_url, "device_token": device_token, "arena_id": arena_id}
+        except Exception:
+            return None
+
+    def _court_metadata_for_path(self, file_path):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as config_file:
+                courts = json.load(config_file)
+            folder_name = os.path.basename(os.path.dirname(file_path))
+            court = next((item for item in courts if sanitize_folder_name(item.get('name', '')) == folder_name), None)
+            if not court or not court.get('court_id'):
+                return None
+            duration_match = re.search(r'_(30|60)s_', os.path.basename(file_path))
+            return {
+                "court_id": court['court_id'],
+                "duration_seconds": int(duration_match.group(1)) if duration_match else 30,
+            }
+        except Exception:
+            return None
 
     def _load_queue(self):
         with self.lock:
@@ -331,12 +350,15 @@ class DriveUploader(QObject):
             except Exception as e:
                 log_error(f"Error saving upload queue: {e}")
 
-    def add_to_queue(self, file_path):
+    def add_to_queue(self, file_path, court_id, duration_seconds, replay_timestamp=None):
         """Adds a video file to the persistent upload queue."""
         queue = self._load_queue()
         if not any(item['file_path'] == file_path for item in queue):
             queue.append({
                 "file_path": file_path,
+                "court_id": court_id,
+                "duration_seconds": duration_seconds,
+                "replay_timestamp": replay_timestamp or datetime.now().astimezone().isoformat(),
                 "added_at": datetime.now().isoformat(),
                 "status": "pending",
                 "retries": 0,
@@ -361,8 +383,15 @@ class DriveUploader(QObject):
                         if fname.endswith(".mp4"):
                             fpath = os.path.join(root, fname)
                             if fpath not in known_files:
+                                metadata = self._court_metadata_for_path(fpath)
+                                if not metadata:
+                                    log_error(f"Replay sem court_id, upload ignorado: {fpath}")
+                                    continue
                                 queue.append({
                                     "file_path": fpath,
+                                    "court_id": metadata["court_id"],
+                                    "duration_seconds": metadata["duration_seconds"],
+                                    "replay_timestamp": datetime.fromtimestamp(os.path.getmtime(fpath)).astimezone().isoformat(),
                                     "added_at": datetime.now().isoformat(),
                                     "status": "pending",
                                     "retries": 0,
@@ -395,46 +424,10 @@ class DriveUploader(QObject):
         self.is_processing = True
 
         try:
-            if not DRIVE_AVAILABLE:
-                self.status_signal.emit("Drive Offline", "#ef4444")
+            upload_config = self._load_upload_config()
+            if not upload_config:
+                self.status_signal.emit("Configure config/supabase_upload.json", "#fbbf24")
                 return
-
-            token_path = os.path.join(AUTH_DIR, 'vibe_token.json')
-            credentials_path = os.path.join(AUTH_DIR, 'credentials.json')
-
-            creds = None
-            if os.path.exists(token_path):
-                try:
-                    creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-                except Exception as e:
-                    log_error(f"Invalid token file: {e}")
-                    creds = None
-            
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
-                    try:
-                        creds.refresh(Request())
-                    except Exception as e:
-                        log_error(f"Token refresh failed: {e}")
-                        creds = None
-
-                if not creds:
-                    if not os.path.exists(credentials_path):
-                        queue = self._load_queue()
-                        pending_count = len([i for i in queue if i.get('status') != 'completed'])
-                        self.status_signal.emit(f"Salvo Local ({pending_count} na Fila - Falta auth/credentials.json)", "#fbbf24")
-                        return
-                    try:
-                        flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                        creds = flow.run_local_server(port=0)
-                        with open(token_path, 'w') as token:
-                            token.write(creds.to_json())
-                    except Exception as e:
-                        log_error(f"OAuth login error: {e}")
-                        self.status_signal.emit("Falha no Login Google", "#ef4444")
-                        return
-
-            service = build('drive', 'v3', credentials=creds)
 
             queue = self._load_queue()
             pending_items = [item for item in queue if item.get('status') != 'completed']
@@ -452,16 +445,38 @@ class DriveUploader(QObject):
                 self.status_signal.emit(f"Enviando ({idx}/{total_pending})...", "#3b82f6")
 
                 try:
-                    file_metadata = {'name': os.path.basename(file_path)}
-                    media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
-                    service.files().create(body=file_metadata, media_body=media).execute()
+                    if not item.get('court_id'):
+                        metadata = self._court_metadata_for_path(file_path)
+                        if metadata:
+                            item.update(metadata)
+                    if not item.get('court_id'):
+                        raise ValueError('court_id ausente na configuração da quadra')
 
-                    # Success!
+                    endpoint = f"{upload_config['backend_url']}/api/replay-control/device/upload"
+                    with open(file_path, 'rb') as video_file:
+                        response = requests.post(
+                            endpoint,
+                            headers={"Authorization": f"Bearer {upload_config['device_token']}"},
+                            data={
+                                "arena_id": upload_config['arena_id'],
+                                "court_id": item['court_id'],
+                                "duration_seconds": str(item.get('duration_seconds', 30)),
+                                "replay_timestamp": item.get('replay_timestamp') or datetime.now().astimezone().isoformat(),
+                            },
+                            files={"video": (os.path.basename(file_path), video_file, "video/mp4")},
+                            timeout=(15, 300),
+                        )
+                    if response.status_code not in (200, 201):
+                        try:
+                            error_message = response.json().get('error', response.text)
+                        except Exception:
+                            error_message = response.text
+                        raise RuntimeError(f"HTTP {response.status_code}: {error_message[:500]}")
+
                     item['status'] = 'completed'
                     item['completed_at'] = datetime.now().isoformat()
                     self._save_queue(queue)
-                    
-                    self.status_signal.emit(f"Vibe Cloud: OK ({idx}/{total_pending})", "#22c55e")
+                    self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
                 except Exception as e:
                     err_msg = str(e)
                     log_error(f"Upload failure ({file_path}): {err_msg}")
@@ -586,7 +601,7 @@ class App(QMainWindow):
         self.camera_thread = None
         self.worker = None
         self.recorder = None
-        self.uploader = DriveUploader()
+        self.uploader = SupabaseUploader()
         self.arcade = ArcadeInput()
 
         self._init_ui()
@@ -608,7 +623,8 @@ class App(QMainWindow):
         
         self.name_in = QLineEdit(); self.name_in.setPlaceholderText("Identificação da Quadra")
         self.url_in = QLineEdit(); self.url_in.setPlaceholderText("URL RTSP")
-        side_layout.addWidget(self.name_in); side_layout.addWidget(self.url_in)
+        self.court_id_in = QLineEdit(); self.court_id_in.setPlaceholderText("ID da Quadra no sistema")
+        side_layout.addWidget(self.name_in); side_layout.addWidget(self.url_in); side_layout.addWidget(self.court_id_in)
         
         btn_add = QPushButton("CADASTRAR QUADRA"); btn_add.clicked.connect(self._add)
         side_layout.addWidget(btn_add)
@@ -707,6 +723,10 @@ class App(QMainWindow):
             return
             
         court_name = self.current_court["name"]
+        court_id = self.current_court.get("court_id", "")
+        if not court_id:
+            self._set_status("Cadastre novamente a quadra com o ID do sistema", "#ef4444")
+            return
         court_dir, clean_court_name = get_court_dir(court_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -719,7 +739,12 @@ class App(QMainWindow):
             
             if success:
                 self.thread_status.emit(f"[{court_name}] Replay de {sec}s Gerado!", "#22c55e")
-                self.uploader.add_to_queue(output_path)
+                self.uploader.add_to_queue(
+                    output_path,
+                    court_id,
+                    sec,
+                    datetime.now().astimezone().isoformat(),
+                )
             else:
                 self.thread_status.emit(f"[{court_name}] Buffer insuficiente ou erro no corte", "#ef4444")
         
@@ -731,8 +756,13 @@ class App(QMainWindow):
         self.log_area.append(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
 
     def _add(self):
-        n, u = self.name_in.text(), self.url_in.text()
-        if n and u: self.courts.append({"name":n, "url":u}); self._save(); self._refresh()
+        n, u, court_id = self.name_in.text().strip(), self.url_in.text().strip(), self.court_id_in.text().strip()
+        if n and u and court_id:
+            self.courts.append({"name": n, "url": u, "court_id": court_id})
+            self._save()
+            self._refresh()
+        else:
+            self._set_status("Preencha nome, URL RTSP e ID da quadra", "#ef4444")
     def _del(self):
         it = self.list_w.currentItem()
         if it:

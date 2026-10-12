@@ -39,6 +39,10 @@ if [[ ! -f "$APP_DIR/config/vibe_config.json" ]]; then
   cp "$APP_DIR/config/vibe_config.example.json" "$APP_DIR/config/vibe_config.json"
 fi
 
+if [[ ! -f "$APP_DIR/config/supabase_upload.json" ]]; then
+  cp "$APP_DIR/config/supabase_upload.example.json" "$APP_DIR/config/supabase_upload.json"
+fi
+
 chmod +x "$APP_DIR/iniciar.sh" "$APP_DIR/atualizar.sh"
 
 if [[ "$ENABLE_SERVICE" == true ]]; then

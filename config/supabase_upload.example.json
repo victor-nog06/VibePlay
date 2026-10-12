@@ -1,0 +1,5 @@
+{
+  "backend_url": "https://SEU-BACKEND.example.com",
+  "device_token": "TOKEN_PRIVADO_COM_PELO_MENOS_40_CARACTERES",
+  "arena_id": "UUID_DA_ARENA_NO_SISTEMA"
+}

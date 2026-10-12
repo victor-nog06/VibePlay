@@ -1,6 +1,7 @@
 [
   {
     "name": "Quadra 1",
-    "url": "rtsp://usuario:senha@192.168.1.100:554/stream"
+    "url": "rtsp://usuario:senha@192.168.1.100:554/stream",
+    "court_id": "UUID_DA_QUADRA_NO_SISTEMA"
   }
 ]

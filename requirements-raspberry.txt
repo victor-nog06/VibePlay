@@ -1,3 +1,2 @@
 # PyQt6, OpenCV e Pygame sao instalados pelo apt no Raspberry Pi.
-google-auth-oauthlib
-google-api-python-client
+requests
