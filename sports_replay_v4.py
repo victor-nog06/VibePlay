@@ -350,6 +350,30 @@ class SupabaseUploader(QObject):
             except Exception as e:
                 log_error(f"Error saving upload queue: {e}")
 
+    def _delete_confirmed_file(self, queue, item):
+        """Deletes a local replay only after the backend confirmed its registration."""
+        file_path = item['file_path']
+        item['status'] = 'confirmed'
+        item['completed_at'] = item.get('completed_at') or datetime.now().isoformat()
+        item['last_error'] = ''
+        self._save_queue(queue)
+
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            item['status'] = 'completed'
+            item['local_deleted_at'] = datetime.now().isoformat()
+            item['last_error'] = ''
+            self._save_queue(queue)
+            log_error(f"Upload confirmado; arquivo local removido: {file_path}")
+            return True
+        except OSError as exc:
+            item['status'] = 'cleanup_pending'
+            item['last_error'] = f"Upload confirmado, mas não foi possível apagar o arquivo: {exc}"
+            self._save_queue(queue)
+            log_error(item['last_error'])
+            return False
+
     def add_to_queue(self, file_path, court_id, duration_seconds, replay_timestamp=None):
         """Adds a video file to the persistent upload queue."""
         queue = self._load_queue()
@@ -435,10 +459,17 @@ class SupabaseUploader(QObject):
             total_pending = len(pending_items)
             for idx, item in enumerate(pending_items, 1):
                 file_path = item['file_path']
+
+                # The remote upload is already confirmed. Only retry local cleanup;
+                # never upload the same video again after a restart or power loss.
+                if item.get('status') in ('confirmed', 'cleanup_pending'):
+                    if self._delete_confirmed_file(queue, item):
+                        self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
+                    continue
                 
                 if not os.path.exists(file_path):
-                    item['status'] = 'completed'
-                    item['last_error'] = 'Arquivo não encontrado'
+                    item['status'] = 'missing'
+                    item['last_error'] = 'Arquivo local não encontrado antes da confirmação do upload'
                     self._save_queue(queue)
                     continue
 
@@ -475,10 +506,8 @@ class SupabaseUploader(QObject):
                             timeout=(15, 60),
                         )
                         if retry_complete.status_code in (200, 201):
-                            item['status'] = 'completed'
-                            item['completed_at'] = datetime.now().isoformat()
-                            self._save_queue(queue)
-                            self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
+                            if self._delete_confirmed_file(queue, item):
+                                self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
                             continue
                         if retry_complete.status_code != 404:
                             raise RuntimeError(f"Falha ao concluir upload: HTTP {retry_complete.status_code} {retry_complete.text[:500]}")
@@ -520,10 +549,8 @@ class SupabaseUploader(QObject):
                     if completion.status_code not in (200, 201):
                         raise RuntimeError(f"Falha ao registrar replay: HTTP {completion.status_code} {completion.text[:500]}")
 
-                    item['status'] = 'completed'
-                    item['completed_at'] = datetime.now().isoformat()
-                    self._save_queue(queue)
-                    self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
+                    if self._delete_confirmed_file(queue, item):
+                        self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
                 except Exception as e:
                     err_msg = str(e)
                     log_error(f"Upload failure ({file_path}): {err_msg}")
