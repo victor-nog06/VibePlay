@@ -61,7 +61,7 @@ O servico grafico pressupoe uma sessao desktop no display `:0`.
 
 ## Upload para o Supabase
 
-O upload e feito pelo backend, sem armazenar a chave administrativa do Supabase no Raspberry.
+O backend gera uma autorização temporária e o Raspberry envia o vídeo diretamente ao Supabase Storage. Somente os metadados passam pela Vercel, e nenhuma chave administrativa do Supabase fica no Raspberry.
 
 1. Configure no backend a variavel `REPLAY_UPLOAD_TOKEN` com um segredo aleatorio de pelo menos 40 caracteres.
 2. Configure `config/supabase_upload.json` com a URL publica do backend, o mesmo token e o ID da arena.

@@ -452,26 +452,73 @@ class SupabaseUploader(QObject):
                     if not item.get('court_id'):
                         raise ValueError('court_id ausente na configuração da quadra')
 
-                    endpoint = f"{upload_config['backend_url']}/api/replay-control/device/upload"
-                    with open(file_path, 'rb') as video_file:
-                        response = requests.post(
-                            endpoint,
-                            headers={"Authorization": f"Bearer {upload_config['device_token']}"},
-                            data={
-                                "arena_id": upload_config['arena_id'],
-                                "court_id": item['court_id'],
-                                "duration_seconds": str(item.get('duration_seconds', 30)),
-                                "replay_timestamp": item.get('replay_timestamp') or datetime.now().astimezone().isoformat(),
-                            },
-                            files={"video": (os.path.basename(file_path), video_file, "video/mp4")},
-                            timeout=(15, 300),
+                    api_base = f"{upload_config['backend_url']}/api/replay-control/device/upload"
+                    api_headers = {
+                        "Authorization": f"Bearer {upload_config['device_token']}",
+                        "Content-Type": "application/json",
+                    }
+                    metadata_payload = {
+                        "arena_id": upload_config['arena_id'],
+                        "court_id": item['court_id'],
+                        "duration_seconds": item.get('duration_seconds', 30),
+                        "replay_timestamp": item.get('replay_timestamp') or datetime.now().astimezone().isoformat(),
+                        "file_size_bytes": os.path.getsize(file_path),
+                    }
+
+                    # If a previous attempt uploaded the file but failed before
+                    # registering it, complete that upload instead of duplicating it.
+                    if item.get('storage_path'):
+                        retry_complete = requests.post(
+                            f"{api_base}/complete",
+                            headers=api_headers,
+                            json={**metadata_payload, "storage_path": item['storage_path']},
+                            timeout=(15, 60),
                         )
-                    if response.status_code not in (200, 201):
-                        try:
-                            error_message = response.json().get('error', response.text)
-                        except Exception:
-                            error_message = response.text
-                        raise RuntimeError(f"HTTP {response.status_code}: {error_message[:500]}")
+                        if retry_complete.status_code in (200, 201):
+                            item['status'] = 'completed'
+                            item['completed_at'] = datetime.now().isoformat()
+                            self._save_queue(queue)
+                            self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
+                            continue
+                        if retry_complete.status_code != 404:
+                            raise RuntimeError(f"Falha ao concluir upload: HTTP {retry_complete.status_code} {retry_complete.text[:500]}")
+                        item.pop('storage_path', None)
+
+                    authorization = requests.post(
+                        f"{api_base}/authorize",
+                        headers=api_headers,
+                        json=metadata_payload,
+                        timeout=(15, 60),
+                    )
+                    if authorization.status_code != 200:
+                        raise RuntimeError(f"Falha na autorização: HTTP {authorization.status_code} {authorization.text[:500]}")
+                    authorization_data = authorization.json()
+                    item['storage_path'] = authorization_data['storage_path']
+                    self._save_queue(queue)
+
+                    # The video bytes go straight from the Raspberry to Supabase.
+                    with open(file_path, 'rb') as video_file:
+                        storage_response = requests.put(
+                            authorization_data['signed_url'],
+                            headers={
+                                "Content-Type": "video/mp4",
+                                "Cache-Control": "max-age=3600",
+                                "x-upsert": "false",
+                            },
+                            data=video_file,
+                            timeout=(15, 600),
+                        )
+                    if storage_response.status_code not in (200, 201):
+                        raise RuntimeError(f"Supabase Storage HTTP {storage_response.status_code}: {storage_response.text[:500]}")
+
+                    completion = requests.post(
+                        f"{api_base}/complete",
+                        headers=api_headers,
+                        json={**metadata_payload, "storage_path": item['storage_path']},
+                        timeout=(15, 60),
+                    )
+                    if completion.status_code not in (200, 201):
+                        raise RuntimeError(f"Falha ao registrar replay: HTTP {completion.status_code} {completion.text[:500]}")
 
                     item['status'] = 'completed'
                     item['completed_at'] = datetime.now().isoformat()
