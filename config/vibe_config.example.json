@@ -1,0 +1,6 @@
+[
+  {
+    "name": "Quadra 1",
+    "url": "rtsp://usuario:senha@192.168.1.100:554/stream"
+  }
+]

@@ -1,0 +1,2 @@
+Coloque o arquivo credentials.json nesta pasta para habilitar o upload ao Google Drive.
+O arquivo vibe_token.json sera criado automaticamente apos a primeira autenticacao.

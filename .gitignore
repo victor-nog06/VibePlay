@@ -1,0 +1,35 @@
+# Credenciais e tokens (nunca enviar ao Git)
+auth/credentials.json
+auth/vibe_token.json
+
+# Configuracao local das cameras (pode conter usuario e senha RTSP)
+config/vibe_config.json
+
+# Ambientes e caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Saidas do PyInstaller e binarios do Windows
+build/
+dist/
+*.exe
+*.spec
+
+# Dados gerados durante a operacao
+replays/*
+!replays/.gitkeep
+uploads/*
+!uploads/pendentes/
+!uploads/pendentes/.gitkeep
+temp/*
+!temp/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Arquivos do sistema e editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

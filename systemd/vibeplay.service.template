@@ -1,0 +1,17 @@
+[Unit]
+Description=VibePlay - Sistema de replays
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory="@APP_DIR@"
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=@HOME@/.Xauthority
+ExecStart="@APP_DIR@/iniciar.sh"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
