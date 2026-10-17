@@ -294,6 +294,7 @@ class SupabaseUploader(QObject):
         self.queue_file = QUEUE_FILE
         self.is_processing = False
         self.lock = threading.Lock()
+        self.upload_config_error = ''
 
         # Background retry timer (checks queue every 15 seconds)
         self.retry_timer = QTimer()
@@ -310,11 +311,41 @@ class SupabaseUploader(QObject):
             backend_url = str(config.get('backend_url', '')).rstrip('/')
             device_token = str(config.get('device_token', '')).strip()
             arena_id = str(config.get('arena_id', '')).strip()
-            if not backend_url or len(device_token) < 40 or not arena_id:
-                return None
+            if not backend_url.startswith('https://'):
+                raise ValueError('backend_url deve começar com https://')
+            if len(device_token) < 40:
+                raise ValueError('device_token ausente ou inválido')
+            if not arena_id:
+                raise ValueError('arena_id ausente')
+            self.upload_config_error = ''
             return {"backend_url": backend_url, "device_token": device_token, "arena_id": arena_id}
-        except Exception:
+        except FileNotFoundError:
+            self.upload_config_error = 'Arquivo config/supabase_upload.json não encontrado'
+            log_error(self.upload_config_error)
             return None
+        except json.JSONDecodeError as exc:
+            self.upload_config_error = f'JSON inválido em config/supabase_upload.json: linha {exc.lineno}'
+            log_error(self.upload_config_error)
+            return None
+        except Exception as exc:
+            self.upload_config_error = f'Configuração do Supabase inválida: {exc}'
+            log_error(self.upload_config_error)
+            return None
+
+    @staticmethod
+    def _friendly_upload_error(error):
+        detail = str(error)
+        if 'HTTP 401' in detail:
+            return 'Chave do Raspberry inválida ou substituída'
+        if 'HTTP 403' in detail:
+            return 'Raspberry ou quadra sem autorização'
+        if 'HTTP 404' in detail and ('autorização' in detail or 'registrar' in detail):
+            return 'Rota de upload não publicada no backend'
+        if 'NameResolutionError' in detail or 'ConnectionError' in detail or 'ConnectTimeout' in detail:
+            return 'Sem conexão com o backend'
+        if 'Supabase Storage HTTP' in detail:
+            return 'Supabase Storage recusou o vídeo'
+        return f'Falha no upload: {detail[:120]}'
 
     def _court_metadata_for_path(self, file_path):
         try:
@@ -478,7 +509,7 @@ class SupabaseUploader(QObject):
         try:
             upload_config = self._load_upload_config()
             if not upload_config:
-                self.status_signal.emit("Configure config/supabase_upload.json", "#fbbf24")
+                self.status_signal.emit(self.upload_config_error or "Configure config/supabase_upload.json", "#fbbf24")
                 return
 
             queue = self._load_queue()
@@ -622,7 +653,8 @@ class SupabaseUploader(QObject):
 
                     queue_current = self._load_queue()
                     rem_count = len([i for i in queue_current if i.get('status') != 'completed'])
-                    self.status_signal.emit(f"Sem Conexão - {rem_count} Vídeo(s) Salvo(s) Localmente", "#fbbf24")
+                    reason = self._friendly_upload_error(e)
+                    self.status_signal.emit(f"{reason} - {rem_count} vídeo(s) local(is)", "#fbbf24")
                     break
 
         except Exception as global_err:

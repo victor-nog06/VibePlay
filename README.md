@@ -1,6 +1,6 @@
 # VibePlay
 
-Sistema portatil de replays com captura RTSP, FFmpeg e upload para o Google Drive.
+Sistema portatil de replays com captura RTSP, FFmpeg e upload seguro para o Supabase.
 
 ## Estrutura
 
@@ -78,3 +78,10 @@ Exemplo:
 ```
 
 Arquivos de credenciais, configuracao local das cameras, replays, temporarios e builds sao ignorados pelo Git.
+
+### Diagnostico do upload
+
+O status da interface diferencia falha de rede, chave invalida, quadra sem autorizacao,
+rota ausente no backend e recusa do Supabase Storage. O detalhe tecnico permanece em
+`logs/vibeplay_errors.log`. Em caso de falha, o video continua na fila local e uma nova
+tentativa e feita automaticamente.
