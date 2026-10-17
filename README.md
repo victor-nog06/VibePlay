@@ -28,7 +28,10 @@ chmod +x instalar_raspberry.sh iniciar.sh atualizar.sh
 ./instalar_raspberry.sh
 ```
 
-Edite `config/vibe_config.json` com os dados reais das cameras e inicie:
+Edite `config/vibe_config.json` com os dados reais das cameras. Cada quadra deve ter
+um `court_id` exclusivo e um `button_index` exclusivo (numeração iniciada em zero,
+como reportada pelo Pygame). Cada câmera mantém seu próprio buffer, e o botão envia
+somente o replay da quadra associada.
 
 ```bash
 ./iniciar.sh

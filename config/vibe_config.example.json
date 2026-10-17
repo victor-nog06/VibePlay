@@ -2,6 +2,13 @@
   {
     "name": "Quadra 1",
     "url": "rtsp://usuario:senha@192.168.1.100:554/stream",
-    "court_id": "UUID_DA_QUADRA_NO_SISTEMA"
+    "court_id": "UUID_DA_QUADRA_NO_SISTEMA",
+    "button_index": 0
+  },
+  {
+    "name": "Quadra 2",
+    "url": "rtsp://usuario:senha@192.168.1.101:554/stream",
+    "court_id": "OUTRO_UUID_DA_QUADRA",
+    "button_index": 1
   }
 ]

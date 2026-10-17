@@ -105,18 +105,21 @@ class FFmpegRecorder(QObject):
     """Background thread that keeps a continuous recording with audio via FFmpeg."""
     status_msg = pyqtSignal(str, str)
 
-    def __init__(self, url):
+    def __init__(self, url, court_id):
         super().__init__()
         self.url = url
+        self.court_id = str(court_id)
         self.process = None
         self.running = False
-        self.segment_pattern = os.path.join(TEMP_DIR, "live_buffer_%03d.ts")
+        self.buffer_dir = os.path.join(TEMP_DIR, self.court_id)
+        os.makedirs(self.buffer_dir, exist_ok=True)
+        self.segment_pattern = os.path.join(self.buffer_dir, "live_buffer_%03d.ts")
         self.started_at = None
 
     def start_recording(self):
         self.running = True
         self.started_at = time.monotonic()
-        for old_segment in glob.glob(os.path.join(TEMP_DIR, "live_buffer_*.ts")):
+        for old_segment in glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")):
             try:
                 os.remove(old_segment)
             except OSError:
@@ -174,7 +177,7 @@ class FFmpegRecorder(QObject):
 
         try:
             segments = sorted(
-                glob.glob(os.path.join(TEMP_DIR, "live_buffer_*.ts")),
+                glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")),
                 key=os.path.getmtime
             )
             needed = math.ceil(seconds / SEGMENT_SECONDS) + 2
@@ -182,7 +185,7 @@ class FFmpegRecorder(QObject):
             if not segments:
                 return False
 
-            snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=TEMP_DIR)
+            snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=self.buffer_dir)
             concat_file = os.path.join(snapshot_dir, "segments.txt")
             snapshot_segments = []
             for index, segment in enumerate(segments):
@@ -663,17 +666,13 @@ class SupabaseUploader(QObject):
 
 class ArcadeInput(QObject):
     """Monitors Arcade USB board / Joystick buttons and handles click counting reliably."""
-    trigger = pyqtSignal(int)
+    trigger = pyqtSignal(int, int)
     hw_status = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
         self.joystick = None
-        self.click_count = 0
-        
-        self.click_timer = QTimer()
-        self.click_timer.setSingleShot(True)
-        self.click_timer.timeout.connect(self._check_clicks)
+        self.pending_clicks = {}
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll)
@@ -728,19 +727,16 @@ class ArcadeInput(QObject):
         try:
             pygame.event.pump()
             for event in pygame.event.get():
-                if event.type in (pygame.JOYBUTTONDOWN, pygame.KEYDOWN):
-                    self.click_count += 1
-                    self.click_timer.stop()
-                    self.click_timer.start(350)
+                if event.type == pygame.JOYBUTTONDOWN:
+                    count, _ = self.pending_clicks.get(event.button, (0, 0))
+                    self.pending_clicks[event.button] = (count + 1, time.monotonic())
+            ready = [button for button, (_, pressed_at) in self.pending_clicks.items()
+                     if time.monotonic() - pressed_at >= 0.35]
+            for button in ready:
+                count, _ = self.pending_clicks.pop(button)
+                self.trigger.emit(button, 30 if count == 1 else 60)
         except Exception as e:
             log_error(f"Poll error: {e}")
-
-    def _check_clicks(self):
-        if self.click_count == 1:
-            self.trigger.emit(30)
-        elif self.click_count >= 2:
-            self.trigger.emit(60)
-        self.click_count = 0
 
 class App(QMainWindow):
     thread_status = pyqtSignal(str, str)
@@ -766,7 +762,7 @@ class App(QMainWindow):
         self.current_court = None
         self.camera_thread = None
         self.worker = None
-        self.recorder = None
+        self.recorders = {}
         self.uploader = SupabaseUploader()
         self.arcade = ArcadeInput()
 
@@ -774,6 +770,7 @@ class App(QMainWindow):
         self._init_arcade()
         self.thread_status.connect(self._set_status)
         self.uploader.status_signal.connect(self._set_status)
+        self._sync_recorders()
 
     def _init_ui(self):
         central = QWidget(); self.setCentralWidget(central)
@@ -790,7 +787,8 @@ class App(QMainWindow):
         self.name_in = QLineEdit(); self.name_in.setPlaceholderText("Identificação da Quadra")
         self.url_in = QLineEdit(); self.url_in.setPlaceholderText("URL RTSP")
         self.court_id_in = QLineEdit(); self.court_id_in.setPlaceholderText("ID da Quadra no sistema")
-        side_layout.addWidget(self.name_in); side_layout.addWidget(self.url_in); side_layout.addWidget(self.court_id_in)
+        self.button_in = QLineEdit(); self.button_in.setPlaceholderText("Botão USB (0, 1, 2...)")
+        side_layout.addWidget(self.name_in); side_layout.addWidget(self.url_in); side_layout.addWidget(self.court_id_in); side_layout.addWidget(self.button_in)
         
         btn_add = QPushButton("CADASTRAR QUADRA"); btn_add.clicked.connect(self._add)
         side_layout.addWidget(btn_add)
@@ -831,8 +829,32 @@ class App(QMainWindow):
 
     def _init_arcade(self):
         self.arcade.hw_status.connect(self._update_hw_status)
-        self.arcade.trigger.connect(self._trigger)
+        self.arcade.trigger.connect(self._trigger_button)
         self.arcade.start()
+
+    def _sync_recorders(self):
+        desired = {str(c.get('court_id')): c for c in self.courts if c.get('court_id') and c.get('url')}
+        for court_id in list(self.recorders):
+            recorder = self.recorders[court_id]
+            court = desired.get(court_id)
+            if not court or recorder.url != court['url']:
+                recorder.stop_recording()
+                self.recorders.pop(court_id, None)
+        for court_id, court in desired.items():
+            if court_id not in self.recorders:
+                recorder = FFmpegRecorder(court['url'], court_id)
+                recorder.status_msg.connect(
+                    lambda text, color, name=court['name']: self._set_status(f'[{name}] {text}', color)
+                )
+                self.recorders[court_id] = recorder
+                recorder.start_recording()
+
+    def _trigger_button(self, button_index, seconds):
+        court = next((c for c in self.courts if c.get('button_index') == button_index), None)
+        if not court:
+            self._set_status(f"Botão USB {button_index} não está associado a uma quadra", "#ef4444")
+            return
+        self._trigger(seconds, court)
 
     def _update_hw_status(self, text, color):
         self.hw_tag.setText(text)
@@ -852,8 +874,6 @@ class App(QMainWindow):
         self.current_court = court
         
         # Stop previous tasks
-        if self.recorder:
-            self.recorder.stop_recording()
         if self.camera_thread and self.camera_thread.isRunning():
             self.worker.running = False
             try:
@@ -868,11 +888,6 @@ class App(QMainWindow):
                 self.old_threads = []
             self.old_threads.append((self.camera_thread, self.worker))
         
-        # Start FFmpeg recording (Audio + Video)
-        self.recorder = FFmpegRecorder(court["url"])
-        self.recorder.status_msg.connect(self._set_status)
-        self.recorder.start_recording()
-
         # Start OpenCV Preview
         self.camera_thread = QThread()
         self.worker = CameraWorker(court["url"])
@@ -883,15 +898,19 @@ class App(QMainWindow):
         self.worker.finished.connect(self.camera_thread.quit)
         self.camera_thread.start()
 
-    def _trigger(self, sec):
-        if not self.recorder or not self.current_court:
+    def _trigger(self, sec, court=None):
+        court = court or self.current_court
+        if not court:
             self._set_status("Câmera / Quadra Não Selecionada", "#ef4444")
             return
-            
-        court_name = self.current_court["name"]
-        court_id = self.current_court.get("court_id", "")
+        court_name = court["name"]
+        court_id = court.get("court_id", "")
         if not court_id:
             self._set_status("Cadastre novamente a quadra com o ID do sistema", "#ef4444")
+            return
+        recorder = self.recorders.get(str(court_id))
+        if not recorder:
+            self._set_status(f"[{court_name}] Gravador não iniciado", "#ef4444")
             return
         court_dir, clean_court_name = get_court_dir(court_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -901,7 +920,7 @@ class App(QMainWindow):
         
         def _process():
             self.thread_status.emit(f"[{court_name}] Cortando {sec}s com Áudio...", "#fbbf24")
-            success = self.recorder.extract_replay(sec, output_path)
+            success = recorder.extract_replay(sec, output_path)
             
             if success:
                 self.thread_status.emit(f"[{court_name}] Replay de {sec}s Gerado!", "#22c55e")
@@ -923,12 +942,18 @@ class App(QMainWindow):
 
     def _add(self):
         n, u, court_id = self.name_in.text().strip(), self.url_in.text().strip(), self.court_id_in.text().strip()
-        if n and u and court_id:
-            self.courts.append({"name": n, "url": u, "court_id": court_id})
+        button_text = self.button_in.text().strip()
+        if n and u and court_id and button_text.isdigit():
+            button_index = int(button_text)
+            if any(c.get('button_index') == button_index for c in self.courts):
+                self._set_status(f"Botão USB {button_index} já está associado a outra quadra", "#ef4444")
+                return
+            self.courts.append({"name": n, "url": u, "court_id": court_id, "button_index": button_index})
             self._save()
             self._refresh()
+            self._sync_recorders()
         else:
-            self._set_status("Preencha nome, URL RTSP e ID da quadra", "#ef4444")
+            self._set_status("Preencha nome, URL, ID da quadra e botão USB numérico", "#ef4444")
     def _del(self):
         it = self.list_w.currentItem()
         if it:
@@ -936,18 +961,37 @@ class App(QMainWindow):
             self.courts = [c for c in self.courts if c["name"] != deleted_court]
             if self.current_court and self.current_court.get("name") == deleted_court:
                 self.current_court = None
-            self._save(); self._refresh()
+            self._save(); self._refresh(); self._sync_recorders()
     def _refresh(self):
         self.list_w.clear()
         for c in self.courts: self.list_w.addItem(c["name"])
     def _load(self):
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                courts = json.load(f)
+            used_buttons = set()
+            next_button = 0
+            for court in courts:
+                configured = court.get('button_index')
+                if isinstance(configured, int) and configured >= 0 and configured not in used_buttons:
+                    used_buttons.add(configured)
+                    continue
+                while next_button in used_buttons:
+                    next_button += 1
+                court['button_index'] = next_button
+                used_buttons.add(next_button)
+            return courts
         return []
     def _save(self):
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.courts, f)
+            json.dump(self.courts, f, indent=2, ensure_ascii=False)
+
+    def closeEvent(self, event):
+        for recorder in self.recorders.values():
+            recorder.stop_recording()
+        if self.worker:
+            self.worker.running = False
+        event.accept()
 
 if __name__ == "__main__":
     def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
