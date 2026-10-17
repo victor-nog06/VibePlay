@@ -542,9 +542,6 @@ class SupabaseUploader(QObject):
                     if not item.get('court_id'):
                         raise ValueError('court_id ausente na configuração da quadra')
 
-                    thumbnail_file = self._ensure_thumbnail(item)
-                    self._save_queue(queue)
-
                     api_base = f"{upload_config['backend_url']}/api/replay-control/device/upload"
                     api_headers = {
                         "Authorization": f"Bearer {upload_config['device_token']}",
@@ -560,21 +557,14 @@ class SupabaseUploader(QObject):
 
                     # If a previous attempt uploaded the file but failed before
                     # registering it, complete that upload instead of duplicating it.
-                    # Queue entries created by older versions have no thumbnail
-                    # authorization and must request a fresh video/JPEG pair.
-                    if item.get('storage_path') and not item.get('thumbnail_path'):
-                        item.pop('storage_path', None)
-                        self._save_queue(queue)
-
-                    if item.get('storage_path') and item.get('thumbnail_path'):
+                    if item.get('storage_path'):
+                        completion_payload = {**metadata_payload, "storage_path": item['storage_path']}
+                        if item.get('thumbnail_path'):
+                            completion_payload['thumbnail_path'] = item['thumbnail_path']
                         retry_complete = requests.post(
                             f"{api_base}/complete",
                             headers=api_headers,
-                            json={
-                                **metadata_payload,
-                                "storage_path": item['storage_path'],
-                                "thumbnail_path": item.get('thumbnail_path'),
-                            },
+                            json=completion_payload,
                             timeout=(15, 60),
                         )
                         if retry_complete.status_code in (200, 201):
@@ -596,7 +586,14 @@ class SupabaseUploader(QObject):
                         raise RuntimeError(f"Falha na autorização: HTTP {authorization.status_code} {authorization.text[:500]}")
                     authorization_data = authorization.json()
                     item['storage_path'] = authorization_data['storage_path']
-                    item['thumbnail_path'] = authorization_data['thumbnail_path']
+                    thumbnail_path = authorization_data.get('thumbnail_path')
+                    thumbnail_signed_url = authorization_data.get('thumbnail_signed_url')
+                    if bool(thumbnail_path) != bool(thumbnail_signed_url):
+                        raise RuntimeError('Backend retornou autorização incompleta para thumbnail')
+                    if thumbnail_path:
+                        item['thumbnail_path'] = thumbnail_path
+                    else:
+                        item.pop('thumbnail_path', None)
                     self._save_queue(queue)
 
                     # The video bytes go straight from the Raspberry to Supabase.
@@ -614,28 +611,30 @@ class SupabaseUploader(QObject):
                     if storage_response.status_code not in (200, 201):
                         raise RuntimeError(f"Supabase Storage HTTP {storage_response.status_code}: {storage_response.text[:500]}")
 
-                    with open(thumbnail_file, 'rb') as thumbnail_image:
-                        thumbnail_response = requests.put(
-                            authorization_data['thumbnail_signed_url'],
-                            headers={
-                                "Content-Type": "image/jpeg",
-                                "Cache-Control": "max-age=3600",
-                                "x-upsert": "false",
-                            },
-                            data=thumbnail_image,
-                            timeout=(15, 120),
-                        )
-                    if thumbnail_response.status_code not in (200, 201):
-                        raise RuntimeError(f"Supabase thumbnail HTTP {thumbnail_response.status_code}: {thumbnail_response.text[:500]}")
+                    if thumbnail_path:
+                        thumbnail_file = self._ensure_thumbnail(item)
+                        self._save_queue(queue)
+                        with open(thumbnail_file, 'rb') as thumbnail_image:
+                            thumbnail_response = requests.put(
+                                thumbnail_signed_url,
+                                headers={
+                                    "Content-Type": "image/jpeg",
+                                    "Cache-Control": "max-age=3600",
+                                    "x-upsert": "false",
+                                },
+                                data=thumbnail_image,
+                                timeout=(15, 120),
+                            )
+                        if thumbnail_response.status_code not in (200, 201):
+                            raise RuntimeError(f"Supabase thumbnail HTTP {thumbnail_response.status_code}: {thumbnail_response.text[:500]}")
 
+                    completion_payload = {**metadata_payload, "storage_path": item['storage_path']}
+                    if item.get('thumbnail_path'):
+                        completion_payload['thumbnail_path'] = item['thumbnail_path']
                     completion = requests.post(
                         f"{api_base}/complete",
                         headers=api_headers,
-                        json={
-                            **metadata_payload,
-                            "storage_path": item['storage_path'],
-                            "thumbnail_path": item['thumbnail_path'],
-                        },
+                        json=completion_payload,
                         timeout=(15, 60),
                     )
                     if completion.status_code not in (200, 201):
