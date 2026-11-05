@@ -16,6 +16,7 @@ import traceback
 import faulthandler
 import requests
 from datetime import datetime
+from button_input import DebouncedButton
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -670,10 +671,7 @@ class SupabaseUploader(QObject):
 class ArcadeInput(QObject):
     """Monitors Arcade USB board / Joystick buttons and handles click counting reliably."""
     POLL_INTERVAL_MS = 10
-    CONTACT_DEBOUNCE_SECONDS = 0.03
-    DOUBLE_CLICK_SECONDS = 0.5
-    MAX_PRESS_SECONDS = 3.0
-    QUIET_SECONDS = 1.0
+
     trigger = pyqtSignal(int, int)
     hw_status = pyqtSignal(str, str)
     button_captured = pyqtSignal(int)
@@ -681,13 +679,14 @@ class ArcadeInput(QObject):
     def __init__(self):
         super().__init__()
         self.joystick = None
-        self.pending_clicks = {}
         self.learning = False
+        self.capture_excluded_buttons = set()
         self.last_hw_status = None
         self.button_states = {}
-        self.button_candidates = {}
-        self.press_started = {}
-        self.blocked_buttons = {}
+        self.debounce_seconds = float(os.environ.get("ARCADE_DEBOUNCE_MS", "50")) / 1000
+        self.pressed_level = int(os.environ.get("ARCADE_PRESSED_LEVEL", "1"))
+        if not 0 < self.debounce_seconds <= 5 or self.pressed_level not in (0, 1):
+            raise ValueError("ARCADE_DEBOUNCE_MS deve ser > 0 e <= 5000; ARCADE_PRESSED_LEVEL deve ser 0 ou 1")
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll)
@@ -695,7 +694,8 @@ class ArcadeInput(QObject):
 
     def start(self):
         try:
-            log_error("Arcade input v2: ciclos completos, filtro de sequência e bloqueio de repetição")
+            log_error("Arcade input v3: transição estável, um corte por pressionamento")
+            log_error(f"Arcade interface=pygame.joystick, pressionado={self.pressed_level}, solto={1 - self.pressed_level}, debounce={self.debounce_seconds * 1000:g}ms")
             if "SDL_VIDEODRIVER" not in os.environ:
                 os.environ["SDL_VIDEODRIVER"] = "dummy"
             if "SDL_AUDIODRIVER" not in os.environ:
@@ -758,75 +758,40 @@ class ArcadeInput(QObject):
             self._report_hardware(f"ARCADE: ERRO ({e})", "#ef4444")
             return False
 
-    def learn_button(self):
-        self.pending_clicks.clear()
+    def learn_button(self, excluded_buttons=()):
         self._reset_button_states()
+        self.capture_excluded_buttons = set(excluded_buttons)
         self.learning = True
 
     def _reset_button_states(self):
-        """Ignore contacts already closed when connecting or entering capture mode."""
+        """A new connection/capture must observe a stable release before any click."""
         self.button_states.clear()
-        self.button_candidates.clear()
-        self.press_started.clear()
-        self.blocked_buttons.clear()
         if self.joystick is not None:
             pygame.event.pump()
-            self.button_states = {
-                button: bool(self.joystick.get_button(button))
-                for button in range(self.joystick.get_numbuttons())
-            }
+            now = time.monotonic()
+            for button in range(self.joystick.get_numbuttons()):
+                state = DebouncedButton(
+                    self.debounce_seconds, self.pressed_level,
+                    log=lambda message, button=button: log_error(f"Arcade botão {button}: {message}"),
+                )
+                self.button_states[button] = state
+                state.update(self.joystick.get_button(button), now)
 
     def _read_button_edges(self):
-        """Accept one stable open-to-closed edge; rearm only after stable release."""
         if self.joystick is None:
             return
         now = time.monotonic()
-        for button in range(self.joystick.get_numbuttons()):
-            pressed = bool(self.joystick.get_button(button))
-            if button in self.blocked_buttons:
-                if pressed:
-                    self.blocked_buttons[button] = now
-                elif now - self.blocked_buttons[button] >= self.QUIET_SECONDS:
-                    self.blocked_buttons.pop(button)
-                    self.button_states[button] = False
-                    self.button_candidates.pop(button, None)
-                continue
-            previous = self.button_states.get(button, pressed)
-            if pressed == previous:
-                self.button_candidates.pop(button, None)
-                continue
-            candidate, since = self.button_candidates.get(button, (None, now))
-            if candidate != pressed:
-                self.button_candidates[button] = (pressed, now)
-                continue
-            if now - since < self.CONTACT_DEBOUNCE_SECONDS:
-                continue
-            self.button_states[button] = pressed
-            self.button_candidates.pop(button, None)
-            if pressed:
-                self.press_started[button] = now
-                continue
-            started = self.press_started.pop(button, None)
-            if started is None:
-                continue
-            if now - started > self.MAX_PRESS_SECONDS:
-                self.pending_clicks.pop(button, None)
+        for button, state in self.button_states.items():
+            if not state.update(self.joystick.get_button(button), now):
                 continue
             if self.learning:
+                if button in self.capture_excluded_buttons:
+                    continue
                 self.learning = False
-                self.pending_clicks.clear()
                 self.button_captured.emit(button)
-                # Other contacts closed during capture must be released first.
                 self._reset_button_states()
                 return
-            count, _ = self.pending_clicks.get(button, (0, 0))
-            if count >= 2:
-                self.pending_clicks.pop(button, None)
-                self.blocked_buttons[button] = now
-                log_error(f"Arcade: sequência excessiva no botão {button}; aguardando sinal estável")
-                continue
-            self.pending_clicks[button] = (count + 1, now)
-            log_error(f"Arcade: clique completo botão {button}, contagem {count + 1}")
+            self.trigger.emit(button, 30)
 
     def _poll(self):
         now = time.time()
@@ -835,7 +800,7 @@ class ArcadeInput(QObject):
             if self.joystick is not None and not self.joystick.get_init():
                 self.joystick.quit()
                 self.joystick = None
-                self.pending_clicks.clear()
+                self.button_states.clear()
                 self._report_hardware("ARCADE: OFF — CONTROLE DESCONECTADO", "#ef4444")
             if self.joystick is None and now - self.last_reconnect_attempt > 3:
                 self.last_reconnect_attempt = now
@@ -847,23 +812,14 @@ class ArcadeInput(QObject):
                     if event.instance_id == self.joystick.get_instance_id():
                         self.joystick.quit()
                         self.joystick = None
-                        self.pending_clicks.clear()
+                        self.button_states.clear()
                         self._report_hardware("ARCADE: OFF — CONTROLE DESCONECTADO", "#ef4444")
             # Repeated SDL button events do not represent new physical presses.
             self._read_button_edges()
-            ready = [button for button, (_, pressed_at) in self.pending_clicks.items()
-                     if time.monotonic() - pressed_at >= self.DOUBLE_CLICK_SECONDS
-                     and not self.button_states.get(button, False)
-                     and not self.button_candidates.get(button, (False, 0))[0]]
-            for button in ready:
-                count, _ = self.pending_clicks.pop(button)
-                log_error(f"Arcade: disparo botão {button}, {count} clique(s)")
-                self.trigger.emit(button, 30 if count == 1 else 60)
-                self.blocked_buttons[button] = time.monotonic()
         except Exception as e:
             log_error(f"Poll error: {e}")
             self.joystick = None
-            self.pending_clicks.clear()
+            self.button_states.clear()
             self._report_hardware(f"ARCADE: ERRO ({e})", "#ef4444")
 
 class App(QMainWindow):
@@ -971,7 +927,9 @@ class App(QMainWindow):
 
     def _learn_button(self):
         self.button_in.clear()
-        self.arcade.learn_button()
+        self.arcade.learn_button(
+            c.get('button_index') for c in self.courts if c is not self.current_court
+        )
         self.capture_button.setText("AGUARDANDO BOTÃO — CLIQUE PARA REINICIAR")
         self._set_status("Aperte o botão físico da quadra para associá-lo", "#fbbf24")
 
@@ -1005,6 +963,10 @@ class App(QMainWindow):
         if not court:
             self._set_status(f"Botão USB {button_index} não está associado a uma quadra", "#ef4444")
             return
+        seconds = court.get("replay_seconds", seconds)
+        if seconds not in (30, 60):
+            self._set_status("Duração da quadra inválida: use replay_seconds 30 ou 60", "#ef4444")
+            return
         self._trigger(seconds, court, source=f"arcade botão {button_index}")
 
     def _update_hw_status(self, text, color):
@@ -1020,7 +982,6 @@ class App(QMainWindow):
         court = self.courts[self.list_w.row(item)]
         self.current_court = court
         self.arcade.learning = False
-        self.arcade.pending_clicks.clear()
         self.capture_button.setText("CAPTURAR BOTÃO")
         self.name_in.setText(court.get("name", ""))
         self.url_in.setText(court.get("url", ""))
@@ -1070,7 +1031,7 @@ class App(QMainWindow):
             self._set_status(f"[{court_name}] Gravador não iniciado", "#ef4444")
             return
         court_dir, clean_court_name = get_court_dir(court_name)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
         output_filename = f"REPLAY_{clean_court_name}_{sec}s_{timestamp}.mp4"
         output_path = os.path.join(court_dir, output_filename)
@@ -1079,6 +1040,7 @@ class App(QMainWindow):
             self.thread_status.emit(f"[{court_name}] Cortando {sec}s com Áudio...", "#fbbf24")
             success = recorder.extract_replay(sec, output_path)
             
+            log_error(f"Resultado do corte: quadra={court_name}, duração={sec}s, sucesso={success}, arquivo={output_path}")
             if success:
                 self.thread_status.emit(f"[{court_name}] Replay de {sec}s Gerado!", "#22c55e")
                 self.uploader.add_to_queue(
@@ -1136,7 +1098,6 @@ class App(QMainWindow):
         for field in (self.name_in, self.url_in, self.court_id_in, self.button_in):
             field.clear()
         self.arcade.learning = False
-        self.arcade.pending_clicks.clear()
         self.capture_button.setText("CAPTURAR BOTÃO")
         self.save_court_button.setText("CADASTRAR QUADRA")
 
@@ -1148,7 +1109,9 @@ class App(QMainWindow):
             self._save(); self._refresh(); self._sync_recorders()
     def _refresh(self):
         self.list_w.clear()
-        for c in self.courts: self.list_w.addItem(c["name"])
+        for c in self.courts:
+            button = c.get('button_index')
+            self.list_w.addItem(f"{c['name']} — Botão {button}" if button is not None else c['name'])
     def _load(self):
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:

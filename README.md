@@ -55,24 +55,44 @@ botao fisico se estiver pressionado e aperte o botao da quadra. Confirme em
 **CADASTRAR QUADRA**. Para editar, selecione a quadra na lista e use
 **SALVAR ALTERACOES**; o botao existente pode ser mantido ou recapturado.
 
-- Um clique gera um replay dos ultimos 30 segundos.
-- Dois cliques, com soltura entre eles e intervalo de ate 500 ms, geram um unico
-  replay dos ultimos 60 segundos. Aguarde o fechamento dessa janela de deteccao.
-- A leitura ocorre a cada 10 ms, com filtro de contato de 30 ms para pressionar
-  e soltar. O clique so e contado depois de apertar e soltar; pressoes maiores
-  que tres segundos sao descartadas.
-- Tres ou mais cliques na mesma sequencia sao descartados como sinal excessivo.
-  Depois de um replay ou sinal excessivo, o botao precisa ficar solto por um
-  segundo para liberar uma nova sequencia. Os atalhos globais de teclado para
-  replay foram removidos; use o botao associado ou os botoes da interface.
-- Contatos ja fechados ao conectar a placa ou iniciar a captura precisam ser
-  soltos antes de um novo aperto. Sinais repetidos do controlador sao ignorados.
+Cada quadra usa um botao exclusivo da placa. A lista mostra a associacao de
+quadra e botao. Durante a captura de outra quadra, botoes ja associados sao
+ignorados; para trocar o botao de uma quadra existente, selecione-a antes.
+Todos os botoes da placa sao monitorados com debounce independente. Apertos
+simultaneos acionam as respectivas quadras, e um botao mantido pressionado nao
+bloqueia os demais. A quadra selecionada na interface nao altera esse roteamento.
+
+- Cada transicao valida de solto para pressionado gera um unico replay de 30s.
+  O campo opcional `replay_seconds` de cada quadra aceita 30 ou 60 e e preservado
+  ao editar a quadra. O agrupamento antigo por clique duplo foi removido: dois
+  apertos completos agora geram dois cortes. Os botoes manuais de 30s/60s continuam.
+- A leitura ocorre a cada 10 ms. Pressionar e soltar exigem estabilidade de 50 ms.
+  Configure `ARCADE_DEBOUNCE_MS` no ambiente (maior que 0, ate 5000 ms).
+- Ao iniciar, reconectar ou entrar em captura, aguarda soltura estavel antes de
+  habilitar a entrada. Segurar o botao ou repetir eventos nao gera novos cortes.
+- A interface e joystick USB via Pygame (`get_button`), e nao GPIO. O nivel
+  logico padrao e 1=pressionado e 0=solto, conforme a semantica de botoes do SDL.
+  Isso nao determina a polaridade eletrica nem o tipo de contato da fiacao.
+  Confirme os niveis reais com o botao solto/apertado antes de configurar
+  `ARCADE_PRESSED_LEVEL=0` para um encoder que reporte o estado invertido.
+- A interface fornece estado de soltura, mas a duracao e medida pelo programa,
+  sem timestamps do sinal eletrico. Pulsos entre leituras podem nao ser vistos.
+  Ruido que imite um aperto estavel por mais que o debounce e indistinguivel de
+  um clique humano; a alimentacao e a fiacao precisam estar estaveis.
+- Logs registram estados estaveis, cliques, pulsos descartados (agregados no
+  maximo uma vez por segundo/botao) e resultado do corte, sem registrar cada leitura.
 - O gravador precisa ter acumulado pelo menos 30 ou 60 segundos de buffer.
 
 A placa deve ser reconhecida pelo Linux como joystick USB com botoes. O status
 mostra o nome e a quantidade de botoes do controlador detectado. Uma placa que
 emula teclado precisa de suporte especifico; o LED aceso sozinho nao comprova
 o reconhecimento USB. Consulte `logs/vibe_erro_log.txt` e `logs/runtime.log`.
+
+Para executar os testes sem placa, cameras ou interface grafica:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ### Inicializacao automatica
 
