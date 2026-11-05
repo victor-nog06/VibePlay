@@ -17,6 +17,9 @@ import faulthandler
 import requests
 from datetime import datetime
 
+# Receive joystick events even while the Qt window owns keyboard focus.
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLabel, QLineEdit, QListWidget, QFrame, 
@@ -668,11 +671,14 @@ class ArcadeInput(QObject):
     """Monitors Arcade USB board / Joystick buttons and handles click counting reliably."""
     trigger = pyqtSignal(int, int)
     hw_status = pyqtSignal(str, str)
+    button_captured = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
         self.joystick = None
         self.pending_clicks = {}
+        self.learning = False
+        self.last_hw_status = None
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll)
@@ -690,44 +696,90 @@ class ArcadeInput(QObject):
             except Exception as e:
                 log_error(f"Pygame init warning: {e}")
                 pygame.joystick.init()
-            
+
+            # SDL needs an initialized video event loop, even with a Qt UI.
+            pygame.display.init()
+            pygame.display.set_mode((1, 1))
+            pygame.event.pump()
             self._try_connect_joystick()
             self.poll_timer.start(50)
             return self.joystick is not None
         except Exception as e:
             log_error(f"ArcadeInput start failed: {e}")
+            self._report_hardware(f"ARCADE: ERRO DE INICIALIZAÇÃO ({e})", "#ef4444")
             return False
+
+    def _report_hardware(self, text, color):
+        if text != self.last_hw_status:
+            self.last_hw_status = text
+            log_error(text)
+            self.hw_status.emit(text, color)
 
     def _try_connect_joystick(self):
         try:
             pygame.joystick.init()
+            pygame.event.pump()
             count = pygame.joystick.get_count()
-            if count > 0:
-                self.joystick = pygame.joystick.Joystick(0)
-                self.joystick.init()
-                self.hw_status.emit("ARCADE: CONECTADO", "#22c55e")
-                return True
-            else:
-                self.joystick = None
-                self.hw_status.emit("ARCADE: OFF", "#ef4444")
-                return False
+            for index in range(count):
+                candidate = None
+                try:
+                    candidate = pygame.joystick.Joystick(index)
+                    candidate.init()
+                    if candidate.get_numbuttons() == 0:
+                        candidate.quit()
+                        continue
+                    self.joystick = candidate
+                    self._report_hardware(
+                        f"ARCADE: CONECTADO — {candidate.get_name()} ({candidate.get_numbuttons()} botões)",
+                        "#22c55e",
+                    )
+                    return True
+                except pygame.error as exc:
+                    log_error(f"Joystick {index}: {exc}")
+                    if candidate is not None:
+                        candidate.quit()
+            self.joystick = None
+            self._report_hardware("ARCADE: OFF — NENHUM CONTROLE USB DETECTADO", "#ef4444")
+            return False
         except Exception as e:
             log_error(f"Joystick connect error: {e}")
+            self.joystick = None
+            self._report_hardware(f"ARCADE: ERRO ({e})", "#ef4444")
             return False
+
+    def learn_button(self):
+        self.pending_clicks.clear()
+        self.learning = True
 
     def _poll(self):
         now = time.time()
-        if not self.joystick and (now - self.last_reconnect_attempt > 3):
-            self.last_reconnect_attempt = now
-            self._try_connect_joystick()
-
-        if not self.joystick:
-            return
-
         try:
             pygame.event.pump()
+            if self.joystick is not None and not self.joystick.get_init():
+                self.joystick.quit()
+                self.joystick = None
+                self.pending_clicks.clear()
+                self._report_hardware("ARCADE: OFF — CONTROLE DESCONECTADO", "#ef4444")
+            if self.joystick is None and now - self.last_reconnect_attempt > 3:
+                self.last_reconnect_attempt = now
+                self._try_connect_joystick()
             for event in pygame.event.get():
+                if event.type == pygame.JOYDEVICEADDED and self.joystick is None:
+                    self._try_connect_joystick()
+                elif event.type == pygame.JOYDEVICEREMOVED and self.joystick is not None:
+                    if event.instance_id == self.joystick.get_instance_id():
+                        self.joystick.quit()
+                        self.joystick = None
+                        self.pending_clicks.clear()
+                        self._report_hardware("ARCADE: OFF — CONTROLE DESCONECTADO", "#ef4444")
                 if event.type == pygame.JOYBUTTONDOWN:
+                    if self.joystick is None or event.instance_id != self.joystick.get_instance_id():
+                        continue
+                    if self.learning:
+                        self.learning = False
+                        self.pending_clicks.clear()
+                        self.button_captured.emit(event.button)
+                        continue
                     count, _ = self.pending_clicks.get(event.button, (0, 0))
                     self.pending_clicks[event.button] = (count + 1, time.monotonic())
             ready = [button for button, (_, pressed_at) in self.pending_clicks.items()
@@ -737,6 +789,9 @@ class ArcadeInput(QObject):
                 self.trigger.emit(button, 30 if count == 1 else 60)
         except Exception as e:
             log_error(f"Poll error: {e}")
+            self.joystick = None
+            self.pending_clicks.clear()
+            self._report_hardware(f"ARCADE: ERRO ({e})", "#ef4444")
 
 class App(QMainWindow):
     thread_status = pyqtSignal(str, str)
@@ -787,11 +842,19 @@ class App(QMainWindow):
         self.name_in = QLineEdit(); self.name_in.setPlaceholderText("Identificação da Quadra")
         self.url_in = QLineEdit(); self.url_in.setPlaceholderText("URL RTSP")
         self.court_id_in = QLineEdit(); self.court_id_in.setPlaceholderText("ID da Quadra no sistema")
-        self.button_in = QLineEdit(); self.button_in.setPlaceholderText("Botão USB (0, 1, 2...)")
+        self.button_in = QLineEdit(); self.button_in.setPlaceholderText("Clique em CAPTURAR e aperte o botão")
+        self.button_in.setReadOnly(True)
         side_layout.addWidget(self.name_in); side_layout.addWidget(self.url_in); side_layout.addWidget(self.court_id_in); side_layout.addWidget(self.button_in)
+        self.capture_button = QPushButton("CAPTURAR BOTÃO")
+        self.capture_button.clicked.connect(self._learn_button)
+        side_layout.addWidget(self.capture_button)
         
-        btn_add = QPushButton("CADASTRAR QUADRA"); btn_add.clicked.connect(self._add)
-        side_layout.addWidget(btn_add)
+        self.save_court_button = QPushButton("CADASTRAR QUADRA")
+        self.save_court_button.clicked.connect(self._add)
+        side_layout.addWidget(self.save_court_button)
+        btn_new = QPushButton("NOVA QUADRA / CANCELAR EDIÇÃO")
+        btn_new.clicked.connect(self._new_court)
+        side_layout.addWidget(btn_new)
         
         side_layout.addSpacing(20); self.list_w = QListWidget()
         self.list_w.itemClicked.connect(self._select)
@@ -830,7 +893,22 @@ class App(QMainWindow):
     def _init_arcade(self):
         self.arcade.hw_status.connect(self._update_hw_status)
         self.arcade.trigger.connect(self._trigger_button)
+        self.arcade.button_captured.connect(self._button_captured)
         self.arcade.start()
+
+    def _learn_button(self):
+        self.button_in.clear()
+        self.arcade.learn_button()
+        self.capture_button.setText("AGUARDANDO BOTÃO — CLIQUE PARA REINICIAR")
+        self._set_status("Aperte o botão físico da quadra para associá-lo", "#fbbf24")
+
+    def _button_captured(self, button_index):
+        self.capture_button.setText("CAPTURAR BOTÃO")
+        if any(c is not self.current_court and c.get('button_index') == button_index for c in self.courts):
+            self._set_status(f"Botão USB {button_index} já está associado a outra quadra", "#ef4444")
+            return
+        self.button_in.setText(str(button_index))
+        self._set_status(f"Botão USB {button_index} identificado. Salve a quadra para confirmar", "#22c55e")
 
     def _sync_recorders(self):
         desired = {str(c.get('court_id')): c for c in self.courts if c.get('court_id') and c.get('url')}
@@ -844,7 +922,7 @@ class App(QMainWindow):
             if court_id not in self.recorders:
                 recorder = FFmpegRecorder(court['url'], court_id)
                 recorder.status_msg.connect(
-                    lambda text, color, name=court['name']: self._set_status(f'[{name}] {text}', color)
+                    lambda text, color, court=court: self._set_status(f'[{court["name"]}] {text}', color)
                 )
                 self.recorders[court_id] = recorder
                 recorder.start_recording()
@@ -859,6 +937,7 @@ class App(QMainWindow):
     def _update_hw_status(self, text, color):
         self.hw_tag.setText(text)
         self.hw_tag.setStyleSheet(f"color: {color}; font-weight: bold;")
+        self._set_status(text, color)
 
     def keyPressEvent(self, event):
         """Keyboard fallback for Arcade / USB Keypads (Space = 30s, Enter/Return = 60s)."""
@@ -870,8 +949,17 @@ class App(QMainWindow):
             super().keyPressEvent(event)
 
     def _select(self, item):
-        court = next(c for c in self.courts if c["name"] == item.text())
+        court = self.courts[self.list_w.row(item)]
         self.current_court = court
+        self.arcade.learning = False
+        self.arcade.pending_clicks.clear()
+        self.capture_button.setText("CAPTURAR BOTÃO")
+        self.name_in.setText(court.get("name", ""))
+        self.url_in.setText(court.get("url", ""))
+        self.court_id_in.setText(str(court.get("court_id") or ""))
+        button_index = court.get("button_index")
+        self.button_in.setText(str(button_index) if button_index is not None else "")
+        self.save_court_button.setText("SALVAR ALTERAÇÕES")
         
         # Stop previous tasks
         if self.camera_thread and self.camera_thread.isRunning():
@@ -906,7 +994,7 @@ class App(QMainWindow):
         court_name = court["name"]
         court_id = court.get("court_id", "")
         if not court_id:
-            self._set_status("Cadastre novamente a quadra com o ID do sistema", "#ef4444")
+            self._set_status("Edite a quadra e informe o ID do sistema", "#ef4444")
             return
         recorder = self.recorders.get(str(court_id))
         if not recorder:
@@ -945,22 +1033,49 @@ class App(QMainWindow):
         button_text = self.button_in.text().strip()
         if n and u and court_id and button_text.isdigit():
             button_index = int(button_text)
-            if any(c.get('button_index') == button_index for c in self.courts):
+            others = [c for c in self.courts if c is not self.current_court]
+            if any(c.get('button_index') == button_index for c in others):
                 self._set_status(f"Botão USB {button_index} já está associado a outra quadra", "#ef4444")
                 return
-            self.courts.append({"name": n, "url": u, "court_id": court_id, "button_index": button_index})
+            if any(c.get('name') == n or str(c.get('court_id')) == court_id for c in others):
+                self._set_status("Nome ou ID já está associado a outra quadra", "#ef4444")
+                return
+            editing = self.current_court is not None
+            old_url = self.current_court.get('url') if editing else None
+            values = {"name": n, "url": u, "court_id": court_id, "button_index": button_index}
+            if editing:
+                self.current_court.update(values)
+            else:
+                self.courts.append(values)
             self._save()
             self._refresh()
             self._sync_recorders()
+            if editing:
+                row = next(i for i, c in enumerate(self.courts) if c is self.current_court)
+                self.list_w.setCurrentRow(row)
+                if old_url != u:
+                    self._select(self.list_w.item(row))
+            else:
+                self._new_court()
+            self._set_status(f"[{n}] Quadra {'atualizada' if editing else 'cadastrada'} — Botão USB {button_index}", "#22c55e")
         else:
-            self._set_status("Preencha nome, URL, ID da quadra e botão USB numérico", "#ef4444")
+            self._set_status("Preencha nome, URL e ID da quadra e capture o botão físico", "#ef4444")
+
+    def _new_court(self):
+        self.current_court = None
+        self.list_w.setCurrentRow(-1)
+        for field in (self.name_in, self.url_in, self.court_id_in, self.button_in):
+            field.clear()
+        self.arcade.learning = False
+        self.arcade.pending_clicks.clear()
+        self.capture_button.setText("CAPTURAR BOTÃO")
+        self.save_court_button.setText("CADASTRAR QUADRA")
+
     def _del(self):
         it = self.list_w.currentItem()
         if it:
-            deleted_court = it.text()
-            self.courts = [c for c in self.courts if c["name"] != deleted_court]
-            if self.current_court and self.current_court.get("name") == deleted_court:
-                self.current_court = None
+            del self.courts[self.list_w.row(it)]
+            self._new_court()
             self._save(); self._refresh(); self._sync_recorders()
     def _refresh(self):
         self.list_w.clear()
@@ -987,6 +1102,8 @@ class App(QMainWindow):
             json.dump(self.courts, f, indent=2, ensure_ascii=False)
 
     def closeEvent(self, event):
+        self.arcade.poll_timer.stop()
+        pygame.quit()
         for recorder in self.recorders.values():
             recorder.stop_recording()
         if self.worker:
