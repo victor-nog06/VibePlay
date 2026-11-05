@@ -59,7 +59,12 @@ botao fisico se estiver pressionado e aperte o botao da quadra. Confirme em
 - Dois cliques, com soltura entre eles e intervalo de ate 500 ms, geram um unico
   replay dos ultimos 60 segundos. Aguarde o fechamento dessa janela de deteccao.
 - A leitura ocorre a cada 10 ms, com filtro de contato de 30 ms para pressionar
-  e soltar. Segurar o botao nao repete o acionamento.
+  e soltar. O clique so e contado depois de apertar e soltar; pressoes maiores
+  que tres segundos sao descartadas.
+- Tres ou mais cliques na mesma sequencia sao descartados como sinal excessivo.
+  Depois de um replay ou sinal excessivo, o botao precisa ficar solto por um
+  segundo para liberar uma nova sequencia. Os atalhos globais de teclado para
+  replay foram removidos; use o botao associado ou os botoes da interface.
 - Contatos ja fechados ao conectar a placa ou iniciar a captura precisam ser
   soltos antes de um novo aperto. Sinais repetidos do controlador sao ignorados.
 - O gravador precisa ter acumulado pelo menos 30 ou 60 segundos de buffer.

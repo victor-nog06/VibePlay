@@ -672,6 +672,8 @@ class ArcadeInput(QObject):
     POLL_INTERVAL_MS = 10
     CONTACT_DEBOUNCE_SECONDS = 0.03
     DOUBLE_CLICK_SECONDS = 0.5
+    MAX_PRESS_SECONDS = 3.0
+    QUIET_SECONDS = 1.0
     trigger = pyqtSignal(int, int)
     hw_status = pyqtSignal(str, str)
     button_captured = pyqtSignal(int)
@@ -684,6 +686,8 @@ class ArcadeInput(QObject):
         self.last_hw_status = None
         self.button_states = {}
         self.button_candidates = {}
+        self.press_started = {}
+        self.blocked_buttons = {}
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll)
@@ -691,6 +695,7 @@ class ArcadeInput(QObject):
 
     def start(self):
         try:
+            log_error("Arcade input v2: ciclos completos, filtro de sequência e bloqueio de repetição")
             if "SDL_VIDEODRIVER" not in os.environ:
                 os.environ["SDL_VIDEODRIVER"] = "dummy"
             if "SDL_AUDIODRIVER" not in os.environ:
@@ -762,6 +767,8 @@ class ArcadeInput(QObject):
         """Ignore contacts already closed when connecting or entering capture mode."""
         self.button_states.clear()
         self.button_candidates.clear()
+        self.press_started.clear()
+        self.blocked_buttons.clear()
         if self.joystick is not None:
             pygame.event.pump()
             self.button_states = {
@@ -776,6 +783,14 @@ class ArcadeInput(QObject):
         now = time.monotonic()
         for button in range(self.joystick.get_numbuttons()):
             pressed = bool(self.joystick.get_button(button))
+            if button in self.blocked_buttons:
+                if pressed:
+                    self.blocked_buttons[button] = now
+                elif now - self.blocked_buttons[button] >= self.QUIET_SECONDS:
+                    self.blocked_buttons.pop(button)
+                    self.button_states[button] = False
+                    self.button_candidates.pop(button, None)
+                continue
             previous = self.button_states.get(button, pressed)
             if pressed == previous:
                 self.button_candidates.pop(button, None)
@@ -788,7 +803,14 @@ class ArcadeInput(QObject):
                 continue
             self.button_states[button] = pressed
             self.button_candidates.pop(button, None)
-            if not pressed:
+            if pressed:
+                self.press_started[button] = now
+                continue
+            started = self.press_started.pop(button, None)
+            if started is None:
+                continue
+            if now - started > self.MAX_PRESS_SECONDS:
+                self.pending_clicks.pop(button, None)
                 continue
             if self.learning:
                 self.learning = False
@@ -798,7 +820,13 @@ class ArcadeInput(QObject):
                 self._reset_button_states()
                 return
             count, _ = self.pending_clicks.get(button, (0, 0))
+            if count >= 2:
+                self.pending_clicks.pop(button, None)
+                self.blocked_buttons[button] = now
+                log_error(f"Arcade: sequência excessiva no botão {button}; aguardando sinal estável")
+                continue
             self.pending_clicks[button] = (count + 1, now)
+            log_error(f"Arcade: clique completo botão {button}, contagem {count + 1}")
 
     def _poll(self):
         now = time.time()
@@ -825,10 +853,13 @@ class ArcadeInput(QObject):
             self._read_button_edges()
             ready = [button for button, (_, pressed_at) in self.pending_clicks.items()
                      if time.monotonic() - pressed_at >= self.DOUBLE_CLICK_SECONDS
+                     and not self.button_states.get(button, False)
                      and not self.button_candidates.get(button, (False, 0))[0]]
             for button in ready:
                 count, _ = self.pending_clicks.pop(button)
+                log_error(f"Arcade: disparo botão {button}, {count} clique(s)")
                 self.trigger.emit(button, 30 if count == 1 else 60)
+                self.blocked_buttons[button] = time.monotonic()
         except Exception as e:
             log_error(f"Poll error: {e}")
             self.joystick = None
@@ -974,7 +1005,7 @@ class App(QMainWindow):
         if not court:
             self._set_status(f"Botão USB {button_index} não está associado a uma quadra", "#ef4444")
             return
-        self._trigger(seconds, court)
+        self._trigger(seconds, court, source=f"arcade botão {button_index}")
 
     def _update_hw_status(self, text, color):
         self.hw_tag.setText(text)
@@ -982,13 +1013,8 @@ class App(QMainWindow):
         self._set_status(text, color)
 
     def keyPressEvent(self, event):
-        """Keyboard fallback for Arcade / USB Keypads (Space = 30s, Enter/Return = 60s)."""
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_1):
-            self._trigger(30)
-        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_2):
-            self._trigger(60)
-        else:
-            super().keyPressEvent(event)
+        """Replay input comes from assigned arcade buttons or explicit UI clicks."""
+        super().keyPressEvent(event)
 
     def _select(self, item):
         court = self.courts[self.list_w.row(item)]
@@ -1028,12 +1054,13 @@ class App(QMainWindow):
         self.worker.finished.connect(self.camera_thread.quit)
         self.camera_thread.start()
 
-    def _trigger(self, sec, court=None):
+    def _trigger(self, sec, court=None, source="interface"):
         court = court or self.current_court
         if not court:
             self._set_status("Câmera / Quadra Não Selecionada", "#ef4444")
             return
         court_name = court["name"]
+        log_error(f"Replay solicitado: origem={source}, quadra={court_name}, duração={sec}s")
         court_id = court.get("court_id", "")
         if not court_id:
             self._set_status("Edite a quadra e informe o ID do sistema", "#ef4444")
