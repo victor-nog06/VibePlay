@@ -43,6 +43,32 @@ Para atualizar depois de novos commits:
 ./atualizar.sh
 ```
 
+O Raspberry executa o mesmo `sports_replay_v4.py` usado no Windows; nao utiliza
+o executavel da pasta `dist/`. A atualizacao preserva as configuracoes locais e
+valida a sintaxe Python antes de reiniciar o servico. Sem servico instalado,
+feche o aplicativo e execute `./iniciar.sh` novamente.
+
+### Cadastro e edicao de quadras e botoes
+
+Preencha nome, URL RTSP e ID da quadra. Clique em **CAPTURAR BOTAO**, solte o
+botao fisico se estiver pressionado e aperte o botao da quadra. Confirme em
+**CADASTRAR QUADRA**. Para editar, selecione a quadra na lista e use
+**SALVAR ALTERACOES**; o botao existente pode ser mantido ou recapturado.
+
+- Um clique gera um replay dos ultimos 30 segundos.
+- Dois cliques, com soltura entre eles e intervalo de ate 500 ms, geram um unico
+  replay dos ultimos 60 segundos. Aguarde o fechamento dessa janela de deteccao.
+- A leitura ocorre a cada 10 ms, com filtro de contato de 30 ms para pressionar
+  e soltar. Segurar o botao nao repete o acionamento.
+- Contatos ja fechados ao conectar a placa ou iniciar a captura precisam ser
+  soltos antes de um novo aperto. Sinais repetidos do controlador sao ignorados.
+- O gravador precisa ter acumulado pelo menos 30 ou 60 segundos de buffer.
+
+A placa deve ser reconhecida pelo Linux como joystick USB com botoes. O status
+mostra o nome e a quantidade de botoes do controlador detectado. Uma placa que
+emula teclado precisa de suporte especifico; o LED aceso sozinho nao comprova
+o reconhecimento USB. Consulte `logs/vibe_erro_log.txt` e `logs/runtime.log`.
+
 ### Inicializacao automatica
 
 Para instalar e habilitar o servico `systemd` durante a configuracao:

@@ -669,6 +669,9 @@ class SupabaseUploader(QObject):
 
 class ArcadeInput(QObject):
     """Monitors Arcade USB board / Joystick buttons and handles click counting reliably."""
+    POLL_INTERVAL_MS = 10
+    CONTACT_DEBOUNCE_SECONDS = 0.03
+    DOUBLE_CLICK_SECONDS = 0.5
     trigger = pyqtSignal(int, int)
     hw_status = pyqtSignal(str, str)
     button_captured = pyqtSignal(int)
@@ -679,6 +682,8 @@ class ArcadeInput(QObject):
         self.pending_clicks = {}
         self.learning = False
         self.last_hw_status = None
+        self.button_states = {}
+        self.button_candidates = {}
         
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll)
@@ -702,7 +707,7 @@ class ArcadeInput(QObject):
             pygame.display.set_mode((1, 1))
             pygame.event.pump()
             self._try_connect_joystick()
-            self.poll_timer.start(50)
+            self.poll_timer.start(self.POLL_INTERVAL_MS)
             return self.joystick is not None
         except Exception as e:
             log_error(f"ArcadeInput start failed: {e}")
@@ -729,6 +734,7 @@ class ArcadeInput(QObject):
                         candidate.quit()
                         continue
                     self.joystick = candidate
+                    self._reset_button_states()
                     self._report_hardware(
                         f"ARCADE: CONECTADO — {candidate.get_name()} ({candidate.get_numbuttons()} botões)",
                         "#22c55e",
@@ -749,7 +755,50 @@ class ArcadeInput(QObject):
 
     def learn_button(self):
         self.pending_clicks.clear()
+        self._reset_button_states()
         self.learning = True
+
+    def _reset_button_states(self):
+        """Ignore contacts already closed when connecting or entering capture mode."""
+        self.button_states.clear()
+        self.button_candidates.clear()
+        if self.joystick is not None:
+            pygame.event.pump()
+            self.button_states = {
+                button: bool(self.joystick.get_button(button))
+                for button in range(self.joystick.get_numbuttons())
+            }
+
+    def _read_button_edges(self):
+        """Accept one stable open-to-closed edge; rearm only after stable release."""
+        if self.joystick is None:
+            return
+        now = time.monotonic()
+        for button in range(self.joystick.get_numbuttons()):
+            pressed = bool(self.joystick.get_button(button))
+            previous = self.button_states.get(button, pressed)
+            if pressed == previous:
+                self.button_candidates.pop(button, None)
+                continue
+            candidate, since = self.button_candidates.get(button, (None, now))
+            if candidate != pressed:
+                self.button_candidates[button] = (pressed, now)
+                continue
+            if now - since < self.CONTACT_DEBOUNCE_SECONDS:
+                continue
+            self.button_states[button] = pressed
+            self.button_candidates.pop(button, None)
+            if not pressed:
+                continue
+            if self.learning:
+                self.learning = False
+                self.pending_clicks.clear()
+                self.button_captured.emit(button)
+                # Other contacts closed during capture must be released first.
+                self._reset_button_states()
+                return
+            count, _ = self.pending_clicks.get(button, (0, 0))
+            self.pending_clicks[button] = (count + 1, now)
 
     def _poll(self):
         now = time.time()
@@ -772,18 +821,11 @@ class ArcadeInput(QObject):
                         self.joystick = None
                         self.pending_clicks.clear()
                         self._report_hardware("ARCADE: OFF — CONTROLE DESCONECTADO", "#ef4444")
-                if event.type == pygame.JOYBUTTONDOWN:
-                    if self.joystick is None or event.instance_id != self.joystick.get_instance_id():
-                        continue
-                    if self.learning:
-                        self.learning = False
-                        self.pending_clicks.clear()
-                        self.button_captured.emit(event.button)
-                        continue
-                    count, _ = self.pending_clicks.get(event.button, (0, 0))
-                    self.pending_clicks[event.button] = (count + 1, time.monotonic())
+            # Repeated SDL button events do not represent new physical presses.
+            self._read_button_edges()
             ready = [button for button, (_, pressed_at) in self.pending_clicks.items()
-                     if time.monotonic() - pressed_at >= 0.35]
+                     if time.monotonic() - pressed_at >= self.DOUBLE_CLICK_SECONDS
+                     and not self.button_candidates.get(button, (False, 0))[0]]
             for button in ready:
                 count, _ = self.pending_clicks.pop(button)
                 self.trigger.emit(button, 30 if count == 1 else 60)
