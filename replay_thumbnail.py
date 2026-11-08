@@ -8,6 +8,26 @@ import tempfile
 import cv2
 
 
+class InvalidReplayError(RuntimeError):
+    """A damaged MP4 must be retained locally and excluded from automatic retry."""
+
+
+def validate_video(ffmpeg, video_path):
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    result = subprocess.run([
+        str(ffmpeg), '-hide_banner', '-loglevel', 'error', '-nostdin',
+        '-threads', '1', '-i', str(video_path), '-map', '0:v:0',
+        '-frames:v', '1', '-an', '-sn', '-threads', '1', '-f', 'null', '-',
+    ], startupinfo=startupinfo, capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        if 'moov atom not found' in result.stderr.lower():
+            raise InvalidReplayError(f'MP4 incompleto ou danificado (moov atom ausente): {video_path}')
+        raise RuntimeError(f'Falha ao validar video: {result.stderr[-1500:]}')
+
+
 def valid_thumbnail(path):
     path = Path(path)
     return path.is_file() and path.stat().st_size > 0 and cv2.imread(str(path)) is not None
@@ -52,6 +72,8 @@ def ensure_thumbnail(ffmpeg, video_path, thumbnail_path, duration_seconds=30, lo
                     log(f'Thumbnail gerada no instante {position:g}s: {destination}')
                     return str(destination)
                 detail = result.stderr[-1500:].strip() or 'FFmpeg nao produziu um quadro JPEG valido'
+                if 'moov atom not found' in detail.lower():
+                    raise InvalidReplayError(f'MP4 incompleto ou danificado (moov atom ausente): {video_path}')
             except subprocess.TimeoutExpired:
                 detail = 'FFmpeg excedeu 60s ao extrair o quadro'
             errors.append(f'{position:g}s: {detail}')

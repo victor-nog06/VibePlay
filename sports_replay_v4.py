@@ -19,7 +19,7 @@ from datetime import datetime
 from button_input import DebouncedButton
 from replay_branding import build_branding
 from replay_timeline import MediaClock, read_segments, select_interval
-from replay_thumbnail import ensure_thumbnail
+from replay_thumbnail import ensure_thumbnail, validate_video, InvalidReplayError
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -198,6 +198,7 @@ class FFmpegRecorder(QObject):
     def extract_replay(self, seconds, output_path, end_time=None):
         """Creates an exact-duration replay from the circular segment buffer."""
         processing_started = time.monotonic()
+        partial_output = output_path + '.partial.mp4'
         try:
             if end_time is None:
                 end_time = self.media_clock.at(processing_started)
@@ -249,7 +250,7 @@ class FFmpegRecorder(QObject):
                 '-pix_fmt', 'yuv420p', '-metadata:s:v:0', 'rotate=0',
                 '-c:a', 'aac', '-b:a', '128k',
                 '-movflags', '+faststart',
-                output_path
+                partial_output
             ]
 
             startupinfo = None
@@ -267,11 +268,17 @@ class FFmpegRecorder(QObject):
             if proc.returncode != 0:
                 log_error(f"Replay extraction FFmpeg error ({proc.returncode}): {proc.stderr[-2000:]}")
                 return False
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            if not os.path.exists(partial_output) or os.path.getsize(partial_output) == 0:
+                return False
+            validate_video(get_ffmpeg_path(), partial_output)
+            os.replace(partial_output, output_path)
+            return True
         except Exception as e:
             log_error(f"Replay extraction error: {traceback.format_exc()}")
             return False
         finally:
+            if os.path.exists(partial_output):
+                os.remove(partial_output)
             log_error(f"Tempo de processamento do replay ({seconds}s): {time.monotonic() - processing_started:.2f}s")
             if 'snapshot_dir' in locals():
                 shutil.rmtree(snapshot_dir, ignore_errors=True)
@@ -494,7 +501,7 @@ class SupabaseUploader(QObject):
                 if not os.path.exists(root_dir): continue
                 for root, _, files in os.walk(root_dir):
                     for fname in files:
-                        if fname.endswith(".mp4"):
+                        if fname.endswith(".mp4") and not fname.endswith('.partial.mp4'):
                             fpath = os.path.join(root, fname)
                             if fpath not in known_files:
                                 metadata = self._court_metadata_for_path(fpath)
@@ -525,7 +532,7 @@ class SupabaseUploader(QObject):
             return
         
         queue = self._load_queue()
-        pending = [item for item in queue if item.get('status') != 'completed']
+        pending = [item for item in queue if item.get('status') not in ('completed', 'invalid_media')]
         
         if not pending:
             return
@@ -544,7 +551,7 @@ class SupabaseUploader(QObject):
                 return
 
             queue = self._load_queue()
-            pending_items = [item for item in queue if item.get('status') != 'completed']
+            pending_items = [item for item in queue if item.get('status') not in ('completed', 'invalid_media')]
             
             total_pending = len(pending_items)
             for idx, item in enumerate(pending_items, 1):
@@ -566,6 +573,8 @@ class SupabaseUploader(QObject):
                 self.status_signal.emit(f"Enviando ({idx}/{total_pending})...", "#3b82f6")
 
                 try:
+                    # Validate before authorization, upload or completion of old attempts.
+                    validate_video(get_ffmpeg_path(), file_path)
                     if not item.get('court_id'):
                         metadata = self._court_metadata_for_path(file_path)
                         if metadata:
@@ -673,6 +682,13 @@ class SupabaseUploader(QObject):
 
                     if self._delete_confirmed_file(queue, item):
                         self.status_signal.emit(f"Supabase: OK ({idx}/{total_pending})", "#22c55e")
+                except InvalidReplayError as exc:
+                    item['status'] = 'invalid_media'
+                    item['last_error'] = str(exc)
+                    self._save_queue(queue)
+                    log_error(f'Video invalido preservado, fila continua: {file_path}: {exc}')
+                    self.status_signal.emit('MP4 danificado preservado; enviando os demais videos', '#fbbf24')
+                    continue
                 except Exception as e:
                     err_msg = str(e)
                     log_error(f"Upload failure ({file_path}): {err_msg}")
@@ -682,7 +698,7 @@ class SupabaseUploader(QObject):
                     self._save_queue(queue)
 
                     queue_current = self._load_queue()
-                    rem_count = len([i for i in queue_current if i.get('status') != 'completed'])
+                    rem_count = len([i for i in queue_current if i.get('status') not in ('completed', 'invalid_media')])
                     reason = self._friendly_upload_error(e)
                     self.status_signal.emit(f"{reason} - {rem_count} vídeo(s) local(is)", "#fbbf24")
                     break

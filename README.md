@@ -186,6 +186,15 @@ parciais. As tentativas usam limite de 60s e threads reduzidas para o Raspberry;
 os detalhes ficam em `logs/vibe_erro_log.txt`. O video original e preservado em
 caso de falha.
 
+MP4s com `moov atom not found` estao incompletos ou danificados. Sao marcados
+como `invalid_media` na fila e preservados no disco para diagnostico; nao sao
+reenviados automaticamente nem bloqueiam os outros videos. Se um arquivo for
+reparado externamente, seu item pode voltar a `pending` com o aplicativo parado.
+Os novos cortes usam `.partial.mp4` durante a geracao, ignorado pela varredura,
+e so recebem o nome final depois de validar a leitura de um quadro do video.
+Uma thumbnail nova nao repara um MP4 danificado. Interrupcoes de energia e
+armazenamento cheio devem ser investigados no Raspberry quando isso ocorrer.
+
 O status da interface diferencia falha de rede, chave invalida, quadra sem autorizacao,
 rota ausente no backend e recusa do Supabase Storage. O detalhe tecnico permanece em
 `logs/vibeplay_errors.log`. Em caso de falha, o video continua na fila local e uma nova

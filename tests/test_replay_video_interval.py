@@ -13,6 +13,7 @@ import unittest
 
 from replay_branding import build_branding
 from replay_timeline import MediaClock, read_segments, select_interval
+from replay_thumbnail import validate_video
 
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = str(ROOT / 'ffmpeg.exe') if (ROOT / 'ffmpeg.exe').exists() else shutil.which('ffmpeg')
@@ -52,6 +53,7 @@ class ReplayVideoIntervalTests(unittest.TestCase):
                 CONFIG_DIR=str(ROOT / 'config'), REPLAY_VIDEO_FILTER=video_filter,
                 SEGMENT_SECONDS=5, MediaClock=MediaClock,
                 read_segments=read_segments, select_interval=select_interval,
+                validate_video=validate_video,
             )
             exec(compile(ast.Module(body=[cls], type_ignores=[]), '<recorder>', 'exec'), namespace)
             recorder = object.__new__(namespace['FFmpegRecorder'])

@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 
-from replay_thumbnail import ensure_thumbnail, valid_thumbnail
+from replay_thumbnail import ensure_thumbnail, valid_thumbnail, validate_video, InvalidReplayError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,11 +67,21 @@ class ThumbnailTests(unittest.TestCase):
     def test_invalid_video_keeps_source_and_cleans_temporary_files(self):
         source = self.destination.parent / 'invalid.mp4'
         source.write_bytes(b'invalid video')
-        with self.assertRaisesRegex(RuntimeError, 'Falha ao extrair thumbnail'):
+        with self.assertRaises(InvalidReplayError):
             ensure_thumbnail(FFMPEG, source, self.destination)
         self.assertEqual(source.read_bytes(), b'invalid video')
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.destination.parent.glob('thumbnail_*')), [])
+
+    def test_video_validation_rejects_missing_moov(self):
+        source = self.destination.parent / 'truncated.mp4'
+        source.write_bytes(b'incomplete MP4')
+        with self.assertRaises(InvalidReplayError):
+            validate_video(FFMPEG, source)
+        self.assertTrue(source.exists())
+
+    def test_video_validation_accepts_complete_mp4(self):
+        validate_video(FFMPEG, self.video)
 
     def test_missing_video(self):
         with self.assertRaisesRegex(RuntimeError, 'Video ausente'):
