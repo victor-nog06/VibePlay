@@ -20,6 +20,36 @@ Rode `gerar_app.bat` sempre que precisar gerar novamente `dist/VibePlay.exe`.
 
 ## Raspberry Pi
 
+### Logos gravadas nos replays
+
+Adicione a logo oficial transparente em `assets/branding/vibe.png`. Ela e
+obrigatoria para exportar novos replays e fica fixa no centro inferior.
+Essa pasta e versionada: depois do commit e push da imagem, `./atualizar.sh`
+baixa a logo junto com o codigo, sem copia manual no Raspberry. Sem configuracao
+local, o aplicativo usa esse caminho automaticamente.
+A logo oficial esta incluida nessa pasta; se o arquivo for removido, o corte falha
+com diagnostico no log, sem publicar um video sem a marca.
+
+Copie `config/branding.example.json` para `config/branding.json` se precisar
+configurar outros caminhos ou patrocinadores. Em `sponsors_left` e
+`sponsors_right`, informe listas de caminhos de imagens, relativos a `config/`.
+Exemplo: `["branding/patrocinador1.png", "branding/patrocinador2.png"]`.
+Cada lado alterna sua lista a cada 10 segundos a partir do inicio do replay.
+Listas vazias deixam espacos transparentes reservados; nao sao desenhadas caixas.
+As imagens preservam proporcao, dentro de 260x120 pixels, em tres colunas
+separadas na parte inferior de 1080x1920. Use PNG com fundo transparente.
+Arquivos configurados ausentes ou invalidos impedem o corte para evitar marcas
+incompletas. A configuracao e local ao Raspberry da arena; sincronizacao com o
+site e sobreposicoes no YouTube ainda nao estao implementadas.
+
+Os novos replays sao exportados em MP4 vertical 9:16, com resolucao 1080x1920,
+H.264/yuv420p e audio AAC quando disponivel. O video preenche a tela sem
+deformacao: imagens horizontais perdem as laterais em um recorte central.
+A gravacao continua e a visualizacao da camera mantem o formato original.
+Essa exportacao usa o mesmo codigo Python no Raspberry e no Windows e nao
+altera os arquivos de replay ja existentes. A resolucao de saida pode aumentar
+o tempo de processamento no Raspberry.
+
 Use Raspberry Pi OS de 64 bits com ambiente grafico. Depois de clonar o repositorio:
 
 ```bash

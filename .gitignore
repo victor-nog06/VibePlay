@@ -5,6 +5,8 @@ auth/vibe_token.json
 # Configuracao local das cameras (pode conter usuario e senha RTSP)
 config/vibe_config.json
 config/supabase_upload.json
+config/branding.json
+config/branding/
 
 # Ambientes e caches Python
 .venv/

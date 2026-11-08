@@ -17,6 +17,7 @@ import faulthandler
 import requests
 from datetime import datetime
 from button_input import DebouncedButton
+from replay_branding import build_branding
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -75,6 +76,10 @@ UPLOAD_CONFIG_FILE = os.path.join(CONFIG_DIR, "supabase_upload.json")
 QUEUE_FILE = os.path.join(UPLOAD_DIR, "vibe_upload_queue.json")
 SEGMENT_SECONDS = 5
 SEGMENT_COUNT = 16  # Mantém aproximadamente 80 segundos em buffer circular.
+REPLAY_VIDEO_FILTER = (
+    'scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2,'
+    'crop=1080:1920,setsar=1'
+)
 
 # Ensure base folders exist
 for folder in [BASE_REPLAYS_DIR, UPLOAD_DIR, PENDING_DIR, TEMP_DIR, CONFIG_DIR, LOG_DIR, AUTH_DIR]:
@@ -180,6 +185,9 @@ class FFmpegRecorder(QObject):
             return False
 
         try:
+            branding_inputs, branding_filter, branded_video = build_branding(
+                CONFIG_DIR, REPLAY_VIDEO_FILTER, seconds
+            )
             segments = sorted(
                 glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")),
                 key=os.path.getmtime
@@ -206,9 +214,12 @@ class FFmpegRecorder(QObject):
                 get_ffmpeg_path(), '-y',
                 '-sseof', f'-{seconds}',
                 '-f', 'concat', '-safe', '0', '-i', concat_file,
+                *branding_inputs,
                 '-t', str(seconds),
-                '-map', '0:v:0', '-map', '0:a?',
+                '-filter_complex', branding_filter,
+                '-map', branded_video, '-map', '0:a?',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-pix_fmt', 'yuv420p', '-metadata:s:v:0', 'rotate=0',
                 '-c:a', 'aac', '-b:a', '128k',
                 '-movflags', '+faststart',
                 output_path
