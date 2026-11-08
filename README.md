@@ -50,6 +50,10 @@ Essa exportacao usa o mesmo codigo Python no Raspberry e no Windows e nao
 altera os arquivos de replay ja existentes. A resolucao de saida pode aumentar
 o tempo de processamento no Raspberry.
 
+Para reduzir esse custo, o recorte vertical e feito antes da ampliacao e cada
+logo estatica e decodificada uma unica vez, sendo reutilizada nos quadros.
+O tempo total de cada corte e registrado em `logs/vibe_erro_log.txt`.
+
 Use Raspberry Pi OS de 64 bits com ambiente grafico. Depois de clonar o repositorio:
 
 ```bash

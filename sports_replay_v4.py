@@ -77,8 +77,8 @@ QUEUE_FILE = os.path.join(UPLOAD_DIR, "vibe_upload_queue.json")
 SEGMENT_SECONDS = 5
 SEGMENT_COUNT = 16  # Mantém aproximadamente 80 segundos em buffer circular.
 REPLAY_VIDEO_FILTER = (
-    'scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2,'
-    'crop=1080:1920,setsar=1'
+    "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',"
+    'scale=1080:1920:flags=fast_bilinear,setsar=1'
 )
 
 # Ensure base folders exist
@@ -184,6 +184,7 @@ class FFmpegRecorder(QObject):
             log_error(f"Replay requested before {seconds}s of buffer were available")
             return False
 
+        processing_started = time.monotonic()
         try:
             branding_inputs, branding_filter, branded_video = build_branding(
                 CONFIG_DIR, REPLAY_VIDEO_FILTER, seconds
@@ -245,6 +246,7 @@ class FFmpegRecorder(QObject):
             log_error(f"Replay extraction error: {traceback.format_exc()}")
             return False
         finally:
+            log_error(f"Tempo de processamento do replay ({seconds}s): {time.monotonic() - processing_started:.2f}s")
             if 'snapshot_dir' in locals():
                 shutil.rmtree(snapshot_dir, ignore_errors=True)
 

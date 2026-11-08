@@ -31,7 +31,8 @@ def build_branding(config_dir, portrait_filter, seconds):
     inputs = []
     filters = [f'[0:v:0]{portrait_filter},setpts=PTS-STARTPTS[base0]']
     for index, (path, x, schedule) in enumerate(slots, 1):
-        inputs.extend(['-loop', '1', '-i', path])
+        # Decode/scale each static image once; overlay reuses its final frame.
+        inputs.extend(['-i', path])
         filters.append(
             f'[{index}:v]scale=260:120:force_original_aspect_ratio=decrease,'
             f'format=rgba,setsar=1[logo{index}]'
@@ -42,6 +43,6 @@ def build_branding(config_dir, portrait_filter, seconds):
             enable = f":enable='eq(mod(floor(t/10),{count}),{position})'"
         filters.append(
             f'[base{index-1}][logo{index}]overlay=x={x}:y=H-180+(120-h)/2:'
-            f'eof_action=repeat:shortest=1{enable}[base{index}]'
+            f'eof_action=repeat{enable}[base{index}]'
         )
     return inputs, ';'.join(filters), f'[base{len(slots)}]'
