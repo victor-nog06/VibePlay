@@ -18,6 +18,7 @@ import requests
 from datetime import datetime
 from button_input import DebouncedButton
 from replay_branding import build_branding
+from replay_timeline import MediaClock, read_segments, select_interval
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -77,8 +78,8 @@ QUEUE_FILE = os.path.join(UPLOAD_DIR, "vibe_upload_queue.json")
 SEGMENT_SECONDS = 5
 SEGMENT_COUNT = 16  # Mantém aproximadamente 80 segundos em buffer circular.
 REPLAY_VIDEO_FILTER = (
-    "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',"
-    'scale=1080:1920:flags=fast_bilinear,setsar=1'
+    "crop=w='min(iw,ih*16/9)':h='min(ih,iw*9/16)',"
+    'scale=1920:1080:flags=fast_bilinear,setsar=1'
 )
 
 # Ensure base folders exist
@@ -124,10 +125,15 @@ class FFmpegRecorder(QObject):
         os.makedirs(self.buffer_dir, exist_ok=True)
         self.segment_pattern = os.path.join(self.buffer_dir, "live_buffer_%03d.ts")
         self.started_at = None
+        self.segment_index = os.path.join(self.buffer_dir, 'segments.csv')
+        self.media_clock = MediaClock()
 
     def start_recording(self):
         self.running = True
         self.started_at = time.monotonic()
+        self.media_clock = MediaClock()
+        if os.path.exists(self.segment_index):
+            os.remove(self.segment_index)
         for old_segment in glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")):
             try:
                 os.remove(old_segment)
@@ -146,12 +152,15 @@ class FFmpegRecorder(QObject):
 
     def _run_ffmpeg(self):
         cmd = [
-            get_ffmpeg_path(), '-y', '-rtsp_transport', 'tcp',
+            get_ffmpeg_path(), '-y', '-nostats', '-progress', 'pipe:1',
+            '-stats_period', '0.1', '-rtsp_transport', 'tcp',
             '-i', self.url,
             '-map', '0:v:0', '-map', '0:a?', '-c', 'copy',
             '-f', 'segment',
             '-segment_time', str(SEGMENT_SECONDS),
             '-segment_wrap', str(SEGMENT_COUNT),
+            '-segment_list', self.segment_index,
+            '-segment_list_type', 'csv', '-segment_list_size', str(SEGMENT_COUNT),
             '-reset_timestamps', '1',
             '-segment_format', 'mpegts',
             self.segment_pattern
@@ -163,14 +172,21 @@ class FFmpegRecorder(QObject):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            self.process = subprocess.Popen(
-                cmd,
-                startupinfo=startupinfo,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            _, stderr = self.process.communicate()
+            # Drain progress continuously; keep stderr separate to avoid pipe deadlocks.
+            with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as errors:
+                self.process = subprocess.Popen(
+                    cmd, startupinfo=startupinfo, stdout=subprocess.PIPE,
+                    stderr=errors, text=True,
+                )
+                for line in self.process.stdout:
+                    key, _, value = line.strip().partition('=')
+                    if key == 'out_time_us' and value.lstrip('-').isdigit():
+                        self.media_clock.record(int(value) / 1_000_000, time.monotonic())
+                self.process.wait()
+                errors.seek(0, os.SEEK_END)
+                length = errors.tell()
+                errors.seek(max(0, length - 4000))
+                stderr = errors.read()
             if self.running and self.process.returncode != 0:
                 log_error(f"FFmpeg stopped ({self.process.returncode}): {stderr[-2000:]}")
                 self.status_msg.emit("Erro FFmpeg / Câmera", "#ef4444")
@@ -178,47 +194,56 @@ class FFmpegRecorder(QObject):
             log_error(f"FFmpeg Recorder Error: {str(e)}")
             self.status_msg.emit("Erro FFmpeg (Audio)", "#ef4444")
 
-    def extract_replay(self, seconds, output_path):
+    def extract_replay(self, seconds, output_path, end_time=None):
         """Creates an exact-duration replay from the circular segment buffer."""
-        if not self.started_at or time.monotonic() - self.started_at < seconds:
-            log_error(f"Replay requested before {seconds}s of buffer were available")
-            return False
-
         processing_started = time.monotonic()
         try:
+            if end_time is None:
+                end_time = self.media_clock.at(processing_started)
+            if end_time < seconds:
+                raise ValueError('Buffer anterior ao clique insuficiente')
+            # Wait for the segment containing the click to close. The target never moves.
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    segments, seek_offset = select_interval(
+                        read_segments(self.segment_index), end_time, seconds
+                    )
+                    break
+                except (OSError, ValueError) as exc:
+                    if time.monotonic() >= deadline or not self.running:
+                        raise ValueError(f'Intervalo do clique indisponivel: {exc}') from exc
+                    time.sleep(.05)
+            log_error(f'Replay fixado na linha do tempo: inicio={end_time-seconds:.3f}s, fim={end_time:.3f}s')
+            # Decode the selected segments before trimming. Input seeking on concat
+            # can land on a later keyframe instead of the requested instant.
+            trim = f'trim=start={seek_offset:.9f}:duration={seconds},setpts=PTS-STARTPTS'
             branding_inputs, branding_filter, branded_video = build_branding(
-                CONFIG_DIR, REPLAY_VIDEO_FILTER, seconds
+                CONFIG_DIR, f'{trim},{REPLAY_VIDEO_FILTER}', seconds
             )
-            segments = sorted(
-                glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")),
-                key=os.path.getmtime
-            )
-            needed = math.ceil(seconds / SEGMENT_SECONDS) + 2
-            segments = segments[-needed:]
-            if not segments:
-                return False
 
             snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=self.buffer_dir)
             concat_file = os.path.join(snapshot_dir, "segments.txt")
             snapshot_segments = []
             for index, segment in enumerate(segments):
                 snapshot = os.path.join(snapshot_dir, f"segment_{index:03d}.ts")
-                shutil.copy2(segment, snapshot)
-                snapshot_segments.append(snapshot)
+                shutil.copy2(segment.path, snapshot)
+                snapshot_segments.append((snapshot, segment.end - segment.start))
 
             with open(concat_file, "w", encoding="utf-8") as file_list:
-                for segment in snapshot_segments:
+                for segment, duration in snapshot_segments:
                     safe_path = segment.replace("'", "'\\''")
                     file_list.write(f"file '{safe_path}'\n")
+                    file_list.write(f'duration {duration:.9f}\n')
 
             cmd = [
                 get_ffmpeg_path(), '-y',
-                '-sseof', f'-{seconds}',
                 '-f', 'concat', '-safe', '0', '-i', concat_file,
                 *branding_inputs,
                 '-t', str(seconds),
                 '-filter_complex', branding_filter,
                 '-map', branded_video, '-map', '0:a?',
+                '-af', f'atrim=start={seek_offset:.9f}:duration={seconds},asetpts=PTS-STARTPTS',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
                 '-pix_fmt', 'yuv420p', '-metadata:s:v:0', 'rotate=0',
                 '-c:a', 'aac', '-b:a', '128k',
@@ -804,6 +829,8 @@ class ArcadeInput(QObject):
                 self.button_captured.emit(button)
                 self._reset_button_states()
                 return
+            # Preserve the first observed edge, before the debounce confirmation.
+            self.last_clicked_at = state.since
             self.trigger.emit(button, 30)
 
     def _poll(self):
@@ -980,7 +1007,8 @@ class App(QMainWindow):
         if seconds not in (30, 60):
             self._set_status("Duração da quadra inválida: use replay_seconds 30 ou 60", "#ef4444")
             return
-        self._trigger(seconds, court, source=f"arcade botão {button_index}")
+        clicked_at = getattr(getattr(self, 'arcade', None), 'last_clicked_at', None)
+        self._trigger(seconds, court, source=f"arcade botão {button_index}", clicked_at=clicked_at)
 
     def _update_hw_status(self, text, color):
         self.hw_tag.setText(text)
@@ -1028,7 +1056,9 @@ class App(QMainWindow):
         self.worker.finished.connect(self.camera_thread.quit)
         self.camera_thread.start()
 
-    def _trigger(self, sec, court=None, source="interface"):
+    def _trigger(self, sec, court=None, source="interface", clicked_at=None):
+        clicked_at = time.monotonic() if clicked_at is None else clicked_at
+        clicked_wall = datetime.now().astimezone()
         court = court or self.current_court
         if not court:
             self._set_status("Câmera / Quadra Não Selecionada", "#ef4444")
@@ -1043,6 +1073,11 @@ class App(QMainWindow):
         if not recorder:
             self._set_status(f"[{court_name}] Gravador não iniciado", "#ef4444")
             return
+        try:
+            replay_end = recorder.media_clock.at(clicked_at)
+        except ValueError as exc:
+            self._set_status(f'[{court_name}] Sem referencia de video no clique: {exc}', '#ef4444')
+            return
         court_dir, clean_court_name = get_court_dir(court_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         
@@ -1051,7 +1086,7 @@ class App(QMainWindow):
         
         def _process():
             self.thread_status.emit(f"[{court_name}] Cortando {sec}s com Áudio...", "#fbbf24")
-            success = recorder.extract_replay(sec, output_path)
+            success = recorder.extract_replay(sec, output_path, end_time=replay_end)
             
             log_error(f"Resultado do corte: quadra={court_name}, duração={sec}s, sucesso={success}, arquivo={output_path}")
             if success:
@@ -1060,7 +1095,7 @@ class App(QMainWindow):
                     output_path,
                     court_id,
                     sec,
-                    datetime.now().astimezone().isoformat(),
+                    clicked_wall.isoformat(),
                 )
             else:
                 self.thread_status.emit(f"[{court_name}] Buffer insuficiente ou erro no corte", "#ef4444")

@@ -37,22 +37,31 @@ Exemplo: `["branding/patrocinador1.png", "branding/patrocinador2.png"]`.
 Cada lado alterna sua lista a cada 10 segundos a partir do inicio do replay.
 Listas vazias deixam espacos transparentes reservados; nao sao desenhadas caixas.
 As imagens preservam proporcao, dentro de 260x120 pixels, em tres colunas
-separadas na parte inferior de 1080x1920. Use PNG com fundo transparente.
+separadas na parte inferior de 1920x1080. Use PNG com fundo transparente.
 Arquivos configurados ausentes ou invalidos impedem o corte para evitar marcas
 incompletas. A configuracao e local ao Raspberry da arena; sincronizacao com o
 site e sobreposicoes no YouTube ainda nao estao implementadas.
 
-Os novos replays sao exportados em MP4 vertical 9:16, com resolucao 1080x1920,
+Os novos replays sao exportados em MP4 horizontal 16:9, com resolucao 1920x1080,
 H.264/yuv420p e audio AAC quando disponivel. O video preenche a tela sem
-deformacao: imagens horizontais perdem as laterais em um recorte central.
+deformacao, com recorte central quando a camera usa outra proporcao.
 A gravacao continua e a visualizacao da camera mantem o formato original.
 Essa exportacao usa o mesmo codigo Python no Raspberry e no Windows e nao
 altera os arquivos de replay ja existentes. A resolucao de saida pode aumentar
 o tempo de processamento no Raspberry.
 
-Para reduzir esse custo, o recorte vertical e feito antes da ampliacao e cada
+Para reduzir esse custo, o recorte e feito antes da ampliacao e cada
 logo estatica e decodificada uma unica vez, sendo reutilizada nos quadros.
 O tempo total de cada corte e registrado em `logs/vibe_erro_log.txt`.
+
+O intervalo e fixado no instante do clique: um replay de 30s corresponde a
+`[clique - 30s, clique]` na linha do tempo do video recebido. O FFmpeg publica
+um indice CSV com inicio/fim dos segmentos; o corte usa esses tempos e nao
+data de modificacao ou o fim da concatenacao. Pode aguardar ate 30s pelo
+fechamento do segmento que contem o clique, sem incluir imagens posteriores
+ao instante fixado. Se houver falha, descontinuidade ou buffer sobrescrito,
+o pedido falha em vez de selecionar outro periodo. A referencia e o video
+recebido, sujeita a latencia RTSP e granularidade de quadros/progresso do FFmpeg.
 
 Use Raspberry Pi OS de 64 bits com ambiente grafico. Depois de clonar o repositorio:
 
