@@ -178,6 +178,14 @@ Arquivos de credenciais, configuracao local das cameras, replays, temporarios e 
 
 ### Diagnostico do upload
 
+A thumbnail e gerada como um unico JPEG de 640 pixels de largura. Se a busca
+no meio do video nao encontrar quadro (por exemplo, video mais curto que a
+duracao cadastrada), tenta o primeiro quadro. Imagens em cache sao validadas,
+e a gravacao usa arquivo temporario com substituicao atomica para evitar JPEGs
+parciais. As tentativas usam limite de 60s e threads reduzidas para o Raspberry;
+os detalhes ficam em `logs/vibe_erro_log.txt`. O video original e preservado em
+caso de falha.
+
 O status da interface diferencia falha de rede, chave invalida, quadra sem autorizacao,
 rota ausente no backend e recusa do Supabase Storage. O detalhe tecnico permanece em
 `logs/vibeplay_errors.log`. Em caso de falha, o video continua na fila local e uma nova

@@ -19,6 +19,7 @@ from datetime import datetime
 from button_input import DebouncedButton
 from replay_branding import build_branding
 from replay_timeline import MediaClock, read_segments, select_interval
+from replay_thumbnail import ensure_thumbnail
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -458,25 +459,10 @@ class SupabaseUploader(QObject):
         file_path = item['file_path']
         thumbnail_file = item.get('thumbnail_file') or os.path.splitext(file_path)[0] + '.jpg'
         item['thumbnail_file'] = thumbnail_file
-        if os.path.exists(thumbnail_file) and os.path.getsize(thumbnail_file) > 0:
-            return thumbnail_file
-
-        seek_seconds = max(1, int(item.get('duration_seconds', 30)) // 2)
-        cmd = [
-            get_ffmpeg_path(), '-y', '-ss', str(seek_seconds), '-i', file_path,
-            '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', thumbnail_file,
-        ]
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        proc = subprocess.run(
-            cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, text=True,
+        return ensure_thumbnail(
+            get_ffmpeg_path(), file_path, thumbnail_file,
+            item.get('duration_seconds', 30), log=log_error,
         )
-        if proc.returncode != 0 or not os.path.exists(thumbnail_file) or os.path.getsize(thumbnail_file) == 0:
-            raise RuntimeError(f"Falha ao extrair thumbnail: {proc.stderr[-500:]}")
-        return thumbnail_file
 
     def add_to_queue(self, file_path, court_id, duration_seconds, replay_timestamp=None):
         """Adds a video file to the persistent upload queue."""
