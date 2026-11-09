@@ -6,6 +6,7 @@ auth/vibe_token.json
 config/vibe_config.json
 config/supabase_upload.json
 config/branding.json
+config/replay_processing.json
 config/branding/
 
 # Ambientes e caches Python

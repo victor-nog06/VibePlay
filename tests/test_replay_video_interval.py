@@ -10,10 +10,12 @@ import tempfile
 import time
 import traceback
 import unittest
+from types import SimpleNamespace
 
 from replay_branding import build_branding
 from replay_timeline import MediaClock, read_segments, select_interval
 from replay_thumbnail import validate_video
+import replay_processing
 
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = str(ROOT / 'ffmpeg.exe') if (ROOT / 'ffmpeg.exe').exists() else shutil.which('ffmpeg')
@@ -45,6 +47,7 @@ class ReplayVideoIntervalTests(unittest.TestCase):
                 str(root / 'live_buffer_%03d.ts'),
             ], check=True, capture_output=True)
             logs = []
+            active_settings = [replay_processing.ProcessingSettings(height=1080, encoder='libx264')]
             namespace = dict(
                 os=os, time=time, glob=glob, shutil=shutil, math=math,
                 tempfile=tempfile, subprocess=subprocess, traceback=traceback,
@@ -54,20 +57,26 @@ class ReplayVideoIntervalTests(unittest.TestCase):
                 SEGMENT_SECONDS=5, MediaClock=MediaClock,
                 read_segments=read_segments, select_interval=select_interval,
                 validate_video=validate_video,
+                replay_processing=SimpleNamespace(
+                    load_settings=lambda folder: active_settings[0],
+                    software_args=replay_processing.software_args, run_render=replay_processing.run_render,
+                    compatibility_args=replay_processing.compatibility_args,
+                ),
             )
             exec(compile(ast.Module(body=[cls], type_ignores=[]), '<recorder>', 'exec'), namespace)
             recorder = object.__new__(namespace['FFmpegRecorder'])
             recorder.buffer_dir, recorder.segment_index, recorder.running = folder, str(index), True
-            for seconds, end in [(30, 37), (60, 67)]:
-                with self.subTest(seconds=seconds):
-                    output = str(root / f'replay_{seconds}.mp4')
+            for seconds, end, height in [(30, 37, 1080), (60, 67, 1080), (30, 37, 720)]:
+                with self.subTest(seconds=seconds, height=height):
+                    active_settings[0] = replay_processing.ProcessingSettings(height=height, encoder='libx264')
+                    output = str(root / f'replay_{seconds}_{height}.mp4')
                     self.assertTrue(recorder.extract_replay(seconds, output, end_time=end), logs)
                     cap = cv2.VideoCapture(output)
                     fps, frames = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
                     self.assertAlmostEqual(frames / fps, seconds, delta=.1)
                     ok, first = cap.read()
                     self.assertTrue(ok)
-                    self.assertEqual(first.shape[:2], (1080, 1920))
+                    self.assertEqual(first.shape[:2], (height, height * 16 // 9))
                     cap.set(cv2.CAP_PROP_POS_FRAMES, frames - 1)
                     ok, last = cap.read()
                     cap.release()

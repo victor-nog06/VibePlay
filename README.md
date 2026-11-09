@@ -36,13 +36,15 @@ configurar outros caminhos ou patrocinadores. Em `sponsors_left` e
 Exemplo: `["branding/patrocinador1.png", "branding/patrocinador2.png"]`.
 Cada lado alterna sua lista a cada 10 segundos a partir do inicio do replay.
 Listas vazias deixam espacos transparentes reservados; nao sao desenhadas caixas.
-As imagens preservam proporcao, dentro de 260x120 pixels, em tres colunas
-separadas na parte inferior de 1920x1080. Use PNG com fundo transparente.
+As imagens preservam proporcao, dentro de 260x120 pixels em Full HD, em tres
+colunas separadas na parte inferior. Em 720p, tamanhos e margens sao reduzidos
+proporcionalmente. Use PNG com fundo transparente.
 Arquivos configurados ausentes ou invalidos impedem o corte para evitar marcas
 incompletas. A configuracao e local ao Raspberry da arena; sincronizacao com o
 site e sobreposicoes no YouTube ainda nao estao implementadas.
 
-Os novos replays sao exportados em MP4 horizontal 16:9, com resolucao 1920x1080,
+Os novos replays sao exportados em MP4 horizontal 16:9, com resolucao padrao
+1280x720 no Raspberry ARM e 1920x1080 nos demais computadores,
 H.264/yuv420p e audio AAC quando disponivel. O video preenche a tela sem
 deformacao, com recorte central quando a camera usa outra proporcao.
 A gravacao continua e a visualizacao da camera mantem o formato original.
@@ -53,6 +55,46 @@ o tempo de processamento no Raspberry.
 Para reduzir esse custo, o recorte e feito antes da ampliacao e cada
 logo estatica e decodificada uma unica vez, sendo reutilizada nos quadros.
 O tempo total de cada corte e registrado em `logs/vibe_erro_log.txt`.
+
+### Desempenho no Raspberry
+
+O trecho do clique e copiado antes de entrar na fila. Por padrao, apenas um
+replay e codificado por vez, com threads automaticas de decodificacao/codificacao
+e filtros, evitando que diversos encoders disputem recursos.
+No Raspberry, o perfil padrao prioriza velocidade em 1280x720 (16:9).
+Para restaurar Full HD, configure `height: 1080`.
+
+Em Linux ARM, `encoder=auto` testa de fato o encoder `h264_v4l2m2m` na resolucao
+de saida; so o usa se funcionar. Caso indisponivel, usa libx264 ultrafast.
+Se falhar durante um corte, repete o mesmo snapshot por software e desabilita
+a tentativa por hardware ate reiniciar. Nao se presume aceleracao em todo
+modelo de Raspberry (inclusive equipamentos sem encoder H.264 disponivel).
+
+Para ajustar, copie `config/replay_processing.example.json` para
+`config/replay_processing.json`. `height` aceita 1080 ou 720; 720 reduz em
+aproximadamente 56% a quantidade de pixels por quadro e redimensiona as marcas
+proporcionalmente. `threads` e `filter_threads` aceitam 0..8 (0=automatico),
+`parallel` aceita 1..4, e `encoder`
+aceita `auto`, `libx264` ou `h264_v4l2m2m`. A configuracao local nao e versionada.
+O log separa espera do segmento, copia, fila e codificacao. Esses tempos sao
+necessarios para medir o ganho real no equipamento, inclusive limitacoes de
+temperatura, alimentacao, armazenamento e quantidade de cameras.
+
+### Reproducao no Safari e outros navegadores no iOS
+
+Novos arquivos usam MP4/H.264 `avc1`, Baseline, 8 bits/yuv420p, nivel 3.1 em
+720p ou 4.1 em 1080p, com limite de 30 fps (fontes mais lentas nao sao elevadas
+a 30 fps). Audio, quando presente, usa AAC-LC, 48 kHz, stereo. `faststart`
+coloca o indice `moov` antes dos dados, e a trilha de video usa timescale 90000.
+Os limites de bitrate de video sao 4 Mbit/s em 720p e 8 Mbit/s em Full HD.
+Arquivos antigos nao sao convertidos automaticamente.
+
+O upload define `Content-Type: video/mp4`, mas a resposta HTTP do player tambem
+precisa fornecer esse tipo e suportar `Range`/`206 Partial Content`. Verifique
+o link efetivamente usado pelo player (inclusive proxies, redirecionamentos e
+URLs assinadas expiradas). A exportacao local nao garante o funcionamento do
+servidor. Para video inline no iPhone, use `playsinline`; reproducao automatica
+com audio pode depender de um toque do usuario.
 
 O intervalo e fixado no instante do clique: um replay de 30s corresponde a
 `[clique - 30s, clique]` na linha do tempo do video recebido. O FFmpeg publica

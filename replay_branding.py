@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 
-def build_branding(config_dir, portrait_filter, seconds):
+def build_branding(config_dir, portrait_filter, seconds, width=1920, height=1080):
     config_dir = Path(config_dir)
     config_file = config_dir / 'branding.json'
     config = json.loads(config_file.read_text(encoding='utf-8-sig')) if config_file.exists() else {}
@@ -29,12 +29,15 @@ def build_branding(config_dir, portrait_filter, seconds):
             slots.append((logo_path(value), x, (index, len(logos))))
 
     inputs = []
+    logo_width = width * 260 // 1920
+    logo_height = height * 120 // 1080
+    bottom_offset = height * 180 // 1080
     filters = [f'[0:v:0]{portrait_filter},setpts=PTS-STARTPTS[base0]']
     for index, (path, x, schedule) in enumerate(slots, 1):
         # Decode/scale each static image once; overlay reuses its final frame.
         inputs.extend(['-i', path])
         filters.append(
-            f'[{index}:v]scale=260:120:force_original_aspect_ratio=decrease,'
+            f'[{index}:v]scale={logo_width}:{logo_height}:force_original_aspect_ratio=decrease,'
             f'format=rgba,setsar=1[logo{index}]'
         )
         enable = ''
@@ -42,7 +45,7 @@ def build_branding(config_dir, portrait_filter, seconds):
             position, count = schedule
             enable = f":enable='eq(mod(floor(t/10),{count}),{position})'"
         filters.append(
-            f'[base{index-1}][logo{index}]overlay=x={x}:y=H-180+(120-h)/2:'
+            f'[base{index-1}][logo{index}]overlay=x={x}:y=H-{bottom_offset}+({logo_height}-h)/2:'
             f'eof_action=repeat{enable}[base{index}]'
         )
     return inputs, ';'.join(filters), f'[base{len(slots)}]'

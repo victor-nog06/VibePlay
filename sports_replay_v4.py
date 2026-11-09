@@ -20,6 +20,7 @@ from button_input import DebouncedButton
 from replay_branding import build_branding
 from replay_timeline import MediaClock, read_segments, select_interval
 from replay_thumbnail import ensure_thumbnail, validate_video, InvalidReplayError
+import replay_processing
 
 # Receive joystick events even while the Qt window owns keyboard focus.
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
@@ -200,6 +201,7 @@ class FFmpegRecorder(QObject):
         processing_started = time.monotonic()
         partial_output = output_path + '.partial.mp4'
         try:
+            processing = replay_processing.load_settings(CONFIG_DIR)
             if end_time is None:
                 end_time = self.media_clock.at(processing_started)
             if end_time < seconds:
@@ -217,20 +219,24 @@ class FFmpegRecorder(QObject):
                         raise ValueError(f'Intervalo do clique indisponivel: {exc}') from exc
                     time.sleep(.05)
             log_error(f'Replay fixado na linha do tempo: inicio={end_time-seconds:.3f}s, fim={end_time:.3f}s')
+            log_error(f'Espera do segmento: {time.monotonic()-processing_started:.2f}s')
             # Decode the selected segments before trimming. Input seeking on concat
             # can land on a later keyframe instead of the requested instant.
             trim = f'trim=start={seek_offset:.9f}:duration={seconds},setpts=PTS-STARTPTS'
             branding_inputs, branding_filter, branded_video = build_branding(
-                CONFIG_DIR, f'{trim},{REPLAY_VIDEO_FILTER}', seconds
+                CONFIG_DIR, f'{trim},{processing.video_filter}', seconds,
+                width=processing.width, height=processing.height,
             )
 
             snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=self.buffer_dir)
             concat_file = os.path.join(snapshot_dir, "segments.txt")
             snapshot_segments = []
+            copying_started = time.monotonic()
             for index, segment in enumerate(segments):
                 snapshot = os.path.join(snapshot_dir, f"segment_{index:03d}.ts")
                 shutil.copy2(segment.path, snapshot)
                 snapshot_segments.append((snapshot, segment.end - segment.start))
+            log_error(f'Copia do buffer: {time.monotonic()-copying_started:.2f}s')
 
             with open(concat_file, "w", encoding="utf-8") as file_list:
                 for segment, duration in snapshot_segments:
@@ -239,17 +245,16 @@ class FFmpegRecorder(QObject):
                     file_list.write(f'duration {duration:.9f}\n')
 
             cmd = [
-                get_ffmpeg_path(), '-y',
+                get_ffmpeg_path(), '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                '-threads', str(processing.threads), '-filter_complex_threads', str(processing.filter_threads),
                 '-f', 'concat', '-safe', '0', '-i', concat_file,
                 *branding_inputs,
                 '-t', str(seconds),
                 '-filter_complex', branding_filter,
                 '-map', branded_video, '-map', '0:a?',
                 '-af', f'atrim=start={seek_offset:.9f}:duration={seconds},asetpts=PTS-STARTPTS',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-pix_fmt', 'yuv420p', '-metadata:s:v:0', 'rotate=0',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-movflags', '+faststart',
+                *replay_processing.software_args(processing),
+                *replay_processing.compatibility_args(processing),
                 partial_output
             ]
 
@@ -258,8 +263,8 @@ class FFmpegRecorder(QObject):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            proc = subprocess.run(
-                cmd,
+            proc = replay_processing.run_render(
+                cmd, processing, log_error,
                 startupinfo=startupinfo,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
