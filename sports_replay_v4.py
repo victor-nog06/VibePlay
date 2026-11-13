@@ -129,19 +129,49 @@ class FFmpegRecorder(QObject):
         self.started_at = None
         self.segment_index = os.path.join(self.buffer_dir, 'segments.csv')
         self.media_clock = MediaClock()
+        # Only one extraction per camera may copy/decode its circular buffer at
+        # a time. This bounds RAM/disk usage when the arcade button is pressed
+        # repeatedly while a previous replay is still rendering.
+        self.extract_lock = threading.Lock()
 
-    def start_recording(self):
-        self.running = True
-        self.started_at = time.monotonic()
-        self.media_clock = MediaClock()
+    def _clear_buffer_files(self):
+        """Remove stale circular segments and abandoned replay snapshots."""
         if os.path.exists(self.segment_index):
-            os.remove(self.segment_index)
+            try:
+                os.remove(self.segment_index)
+            except OSError:
+                pass
         for old_segment in glob.glob(os.path.join(self.buffer_dir, "live_buffer_*.ts")):
             try:
                 os.remove(old_segment)
             except OSError:
                 pass
-        threading.Thread(target=self._run_ffmpeg, daemon=True).start()
+        for old_snapshot in glob.glob(os.path.join(self.buffer_dir, "replay_*")):
+            if os.path.isdir(old_snapshot):
+                shutil.rmtree(old_snapshot, ignore_errors=True)
+
+    def start_recording(self):
+        self.running = True
+        self.started_at = time.monotonic()
+        self.media_clock = MediaClock()
+        self._clear_buffer_files()
+        threading.Thread(target=self._recording_loop, daemon=True).start()
+
+    def _recording_loop(self):
+        """Keep the RTSP recorder alive and rebuild a fresh buffer after failures."""
+        first_attempt = True
+        while self.running:
+            if not first_attempt:
+                self.media_clock = MediaClock()
+                self.started_at = time.monotonic()
+                self._clear_buffer_files()
+                log_error(f"Reiniciando FFmpeg da quadra {self.court_id} e limpando buffer antigo")
+                self.status_msg.emit("Reconectando câmera / reconstruindo buffer", "#fbbf24")
+            first_attempt = False
+            self._run_ffmpeg()
+            self.process = None
+            if self.running:
+                time.sleep(2)
 
     def stop_recording(self):
         self.running = False
@@ -197,6 +227,17 @@ class FFmpegRecorder(QObject):
             self.status_msg.emit("Erro FFmpeg (Audio)", "#ef4444")
 
     def extract_replay(self, seconds, output_path, end_time=None):
+        # Queue repeated clicks for this camera instead of running several
+        # Full-HD decoders concurrently on a Raspberry Pi.
+        extract_lock = getattr(self, 'extract_lock', None)
+        if extract_lock is None:
+            # Compatibility with test/legacy instances that did not run the
+            # current __init__. Normal application instances always have it.
+            return self._extract_replay(seconds, output_path, end_time=end_time)
+        with extract_lock:
+            return self._extract_replay(seconds, output_path, end_time=end_time)
+
+    def _extract_replay(self, seconds, output_path, end_time=None):
         """Creates an exact-duration replay from the circular segment buffer."""
         processing_started = time.monotonic()
         partial_output = output_path + '.partial.mp4'
@@ -227,6 +268,7 @@ class FFmpegRecorder(QObject):
                 CONFIG_DIR, f'{trim},{processing.video_filter}', seconds,
                 width=processing.width, height=processing.height,
             )
+            branding_filter, branded_video = replay_processing.normalize_video(branding_filter, branded_video)
 
             snapshot_dir = tempfile.mkdtemp(prefix="replay_", dir=self.buffer_dir)
             concat_file = os.path.join(snapshot_dir, "segments.txt")

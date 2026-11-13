@@ -20,17 +20,17 @@ class ProcessingTests(unittest.TestCase):
             self.assertEqual((settings.width, settings.height), (1920, 1080))
             self.assertEqual(settings.parallel, 1)
 
-    def test_raspberry_defaults_to_720p_and_allows_1080p(self):
+    def test_raspberry_and_legacy_config_keep_full_hd(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(processing, 'is_arm_linux', return_value=True):
-            self.assertEqual(processing.load_settings(folder).height, 720)
-            (Path(folder) / 'replay_processing.json').write_text(json.dumps(dict(height=1080)))
+            self.assertEqual(processing.load_settings(folder).height, 1080)
+            (Path(folder) / 'replay_processing.json').write_text(json.dumps(dict(height=720)))
             self.assertEqual(processing.load_settings(folder).height, 1080)
 
-    def test_optional_720p_and_invalid_settings(self):
+    def test_fixed_full_hd_and_invalid_settings(self):
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / 'replay_processing.json'
             config.write_text(json.dumps(dict(height=720)))
-            self.assertEqual(processing.load_settings(folder).width, 1280)
+            self.assertEqual(processing.load_settings(folder).width, 1920)
             config.write_text(json.dumps(dict(parallel=0)))
             with self.assertRaises(ValueError):
                 processing.load_settings(folder)
@@ -55,6 +55,24 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(commands[0][commands[0].index('-tag:v') + 1], 'avc1')
         self.assertIn('libx264', commands[1])
         self.assertIn('libx264', commands[2])
+
+    def test_successful_driver_with_bad_sps_also_falls_back(self):
+        commands = []
+        def run(cmd, **kwargs):
+            commands.append(cmd)
+            return SimpleNamespace(returncode=0, stderr='')
+        settings = processing.ProcessingSettings(encoder='h264_v4l2m2m')
+        with patch.object(processing, 'hardware_works', return_value=True), \
+             patch.object(processing, 'compatible_h264', return_value=False), \
+             patch.object(processing.subprocess, 'run', side_effect=run):
+            self.assertEqual(processing.run_render(self.command(), settings, lambda _: None).returncode, 0)
+        self.assertEqual(len(commands), 2)
+        self.assertIn('h264_v4l2m2m', commands[0])
+        self.assertIn('libx264', commands[1])
+        for command in commands:
+            for option, value in [('-r:v', '30'), ('-enc_time_base:v', '1:30'),
+                                  ('-level:v', '41'), ('-maxrate', '8000k'), ('-bufsize', '16000k')]:
+                self.assertEqual(command[command.index(option)+1], value)
 
     def test_only_one_render_runs_at_a_time(self):
         lock = threading.Lock()

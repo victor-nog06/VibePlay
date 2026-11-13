@@ -61,12 +61,13 @@ class ReplayVideoIntervalTests(unittest.TestCase):
                     load_settings=lambda folder: active_settings[0],
                     software_args=replay_processing.software_args, run_render=replay_processing.run_render,
                     compatibility_args=replay_processing.compatibility_args,
+                    normalize_video=replay_processing.normalize_video,
                 ),
             )
             exec(compile(ast.Module(body=[cls], type_ignores=[]), '<recorder>', 'exec'), namespace)
             recorder = object.__new__(namespace['FFmpegRecorder'])
             recorder.buffer_dir, recorder.segment_index, recorder.running = folder, str(index), True
-            for seconds, end, height in [(30, 37, 1080), (60, 67, 1080), (30, 37, 720)]:
+            for seconds, end, height in [(30, 37, 1080), (60, 67, 1080)]:
                 with self.subTest(seconds=seconds, height=height):
                     active_settings[0] = replay_processing.ProcessingSettings(height=height, encoder='libx264')
                     output = str(root / f'replay_{seconds}_{height}.mp4')
